@@ -35,6 +35,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,8 +91,9 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	Scheduler   bool `json:"scheduler"`
-	UsagePlugin bool `json:"usage_plugin"`
+	Scheduler                 bool `json:"scheduler"`
+	SchedulerAcrossPriorities bool `json:"scheduler_across_priorities"`
+	UsagePlugin               bool `json:"usage_plugin"`
 }
 
 func main() {}
@@ -132,7 +134,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 }
 
 //export cliproxyPluginFree
-func cliproxyPluginFree(ptr unsafe.Pointer, _len C.size_t) {
+func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 	if ptr != nil {
 		C.free(ptr)
 	}
@@ -215,8 +217,9 @@ func pluginRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			Scheduler:   true,
-			UsagePlugin: true,
+			Scheduler:                 true,
+			SchedulerAcrossPriorities: true,
+			UsagePlugin:               true,
 		},
 	}
 }
@@ -301,8 +304,12 @@ func pickAuth(raw []byte) ([]byte, error) {
 	defer inflight.Unlock()
 	sweepStale(now, cfg.slotTTL)
 
-	// Candidates arrive in host priority order; pick the first with free capacity.
-	// Unlimited credentials always have capacity, so they act as the natural fallback.
+	// Host sends every priority tier (scheduler_across_priorities) sorted by ID,
+	// not by priority. Reorder so a full high-priority credential falls through
+	// to the next tier instead of an unlimited lower-priority one jumping the queue.
+	sort.SliceStable(req.Candidates, func(i, j int) bool {
+		return req.Candidates[i].Priority > req.Candidates[j].Priority
+	})
 	for _, candidate := range req.Candidates {
 		limit := limitFor(cfg, candidate)
 		if limit <= 0 {

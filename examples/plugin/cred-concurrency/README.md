@@ -6,9 +6,10 @@ priority order.
 
 ## How it works
 
-- `scheduler.pick`: candidates arrive in host priority order. The plugin picks
-  the first candidate whose in-flight count is below its limit. Credentials
-  without a limit have unlimited capacity, so they act as the natural fallback.
+- `scheduler.pick`: the plugin opts into every priority tier
+  (`scheduler_across_priorities`). It sorts by priority, then picks the first
+  candidate under its limit. Credentials without a limit are unlimited, so a
+  lower-priority provider is the fallback once higher tiers are full.
   If every limited candidate is busy and no unlimited candidate remains, the
   pick is rejected with `auth_unavailable` so the conductor moves to the next
   provider group.
