@@ -85,6 +85,19 @@ func TestNoLimitedCandidatesDelegates(t *testing.T) {
 	}
 }
 
+func TestHigherPriorityWinsEvenIfListedLast(t *testing.T) {
+	defer func() { inflight.slots = map[string][]time.Time{} }()
+	// Host across-priority list is ID-sorted, so the cheap fallback can arrive first.
+	cands := `[{"ID":"glm","Provider":"openrouter","Priority":5},{"ID":"eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}]`
+	if r := pick(t, cands); r.AuthID != "eps" {
+		t.Fatalf("pick = %+v, want eps ahead of glm", r)
+	}
+	r := pick(t, cands)
+	if r.AuthID != "glm" {
+		t.Fatalf("fallback pick = %+v, want glm", r)
+	}
+}
+
 func TestAllBusyRejects(t *testing.T) {
 	defer func() { inflight.slots = map[string][]time.Time{} }()
 	cands := `[{"ID":"eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}]`
