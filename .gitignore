@@ -67,3 +67,9 @@ docker-compose.override.yml
 
 # Local LLM Wiki vault
 .llm-wiki
+
+# Local plaintext keys (managed by agent-cliproxy-tuner)
+.local-*
+# Environment-specific config snapshots (contain secrets)
+config.production.yaml
+config.staging.yaml

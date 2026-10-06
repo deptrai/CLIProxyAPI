@@ -493,6 +493,7 @@ upstream:
 #       keys:
 #         - api-key: "AIzaSy...01"
 #           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           max-concurrent: 5 # optional: max concurrent requests; omit = unlimited
 #         # A second key shares this group's endpoint, headers, and models.
 #         - api-key: "replace-with-second-gemini-key"
 #           weight: 2
