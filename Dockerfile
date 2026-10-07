@@ -18,6 +18,8 @@ RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X 'main.V
 
 RUN cd examples/plugin/cred-concurrency/go && CGO_ENABLED=1 GOOS=linux go build -buildmode=c-shared -o /app/plugins/cred-concurrency.so .
 
+RUN cd examples/plugin/request-logs/go && CGO_ENABLED=1 GOOS=linux go build -buildmode=c-shared -o /app/plugins/request-logs.so .
+
 FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
