@@ -121,6 +121,7 @@ type logEntry struct {
 	DurationMs     int64         `json:"duration_ms"`
 	Session        string        `json:"session,omitempty"`
 	ParentSession  string        `json:"parent_session,omitempty"`
+	LastActivity   int64         `json:"last_activity,omitempty"` // unix seconds, guards long streams from the stale sweep
 	Source         string        `json:"source,omitempty"`
 	Prompt         string        `json:"prompt,omitempty"` // capped at 12KB
 	ReasoningLevel string        `json:"reasoning_level,omitempty"`
@@ -135,6 +136,21 @@ var store = struct {
 
 var persistOnce sync.Once
 
+// maxPersistLoadBytes caps how much of the persist file is read into memory
+// at startup; only the tail (newest entries) is loaded.
+const maxPersistLoadBytes = 4 << 20 // 4MB
+
+// snapshotEntry returns a deep copy of an entry so it can be marshalled
+// outside the store lock without racing concurrent mutations.
+func snapshotEntry(e *logEntry) *logEntry {
+	if e == nil {
+		return nil
+	}
+	cp := *e
+	cp.Attempts = append([]attemptView{}, e.Attempts...)
+	return &cp
+}
+
 // persistAppend appends the latest snapshot of an entry as one JSONL line.
 // On load the last line for a RequestID wins.
 func persistAppend(e *logEntry) {
@@ -148,6 +164,7 @@ func persistAppend(e *logEntry) {
 	}
 	f, errOpen := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if errOpen != nil {
+		log.Printf("request-logs: persist open failed: %v", errOpen)
 		return
 	}
 	defer func() {
@@ -180,9 +197,47 @@ func persistLoadOnce() {
 		if path == "" {
 			return
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
+		data, stat, statErr := func() ([]byte, int64, error) {
+			info, err := os.Stat(path)
+			if err != nil {
+				return nil, 0, err
+			}
+			if info.Size() <= maxPersistLoadBytes {
+				d, err := os.ReadFile(path)
+				return d, info.Size(), err
+			}
+			// Large file: read only the tail to avoid loading e.g. a 1.9GB
+			// JSONL file into RAM at boot.
+			f, err := os.Open(path)
+			if err != nil {
+				return nil, 0, err
+			}
+			defer func() {
+				if errClose := f.Close(); errClose != nil {
+					log.Printf("request-logs: persist close failed: %v", errClose)
+				}
+			}()
+			if _, err := f.Seek(info.Size()-maxPersistLoadBytes, 0); err != nil {
+				return nil, 0, err
+			}
+			d := make([]byte, maxPersistLoadBytes)
+			n, err := f.Read(d)
+			if err != nil && n == 0 {
+				return nil, 0, err
+			}
+			return d[:n], info.Size(), nil
+		}()
+		if statErr != nil {
 			return
+		}
+		// When reading a tail, the first line may be truncated mid-JSON:
+		// skip up to and including the first newline.
+		if stat > maxPersistLoadBytes {
+			if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+				data = data[idx+1:]
+			} else {
+				data = nil
+			}
 		}
 		maxEntries := configOrDefault().MaxEntries
 		byID := map[string]*logEntry{}
@@ -211,6 +266,7 @@ func persistLoadOnce() {
 		if len(order) > maxEntries {
 			order = order[len(order)-maxEntries:]
 		}
+		var kept []*logEntry
 		store.Lock()
 		for _, id := range order {
 			e := byID[id]
@@ -219,8 +275,22 @@ func persistLoadOnce() {
 			}
 			store.order = append(store.order, e)
 			store.byID[id] = e
+			kept = append(kept, e)
 		}
 		store.Unlock()
+		log.Printf("request-logs: restored %d entries from persist file", len(kept))
+		// Compact the file so it shrinks back to the retained entries after
+		// each restart instead of growing unbounded.
+		var sb bytes.Buffer
+		enc := json.NewEncoder(&sb)
+		for _, e := range kept {
+			if err := enc.Encode(e); err != nil {
+				continue
+			}
+		}
+		if err := os.WriteFile(path, sb.Bytes(), 0o600); err != nil {
+			log.Printf("request-logs: persist compact failed: %v", err)
+		}
 	})
 }
 
@@ -277,7 +347,11 @@ func entriesSnapshot() []*logEntry {
 	out := make([]*logEntry, 0, len(store.order))
 	for i := len(store.order) - 1; i >= 0; i-- {
 		e := store.order[i]
-		if e.Outcome == "running" && e.Time > 0 && e.Time < staleBefore {
+		act := e.LastActivity
+		if act == 0 {
+			act = e.Time
+		}
+		if e.Outcome == "running" && act > 0 && act < staleBefore {
 			e.Outcome = "stale"
 			e.Running = false
 			e.Error = "no terminal event recorded (stale)"
@@ -655,8 +729,10 @@ func handleInterceptBefore(raw []byte) ([]byte, error) {
 		}
 		e.Outcome = "running"
 		e.Running = true
+		e.LastActivity = time.Now().Unix()
+		snap := snapshotEntry(e)
 		store.Unlock()
-		persistAppend(e)
+		persistAppend(snap)
 	}
 	return okEnvelope(map[string]any{})
 }
@@ -694,8 +770,10 @@ func handleInterceptAfter(raw []byte) ([]byte, error) {
 		e.Requested = req.RequestedModel
 	}
 	e.Stream = e.Stream || req.Stream
+	e.LastActivity = time.Now().Unix()
+	snap := snapshotEntry(e)
 	store.Unlock()
-	persistAppend(e)
+	persistAppend(snap)
 	return okEnvelope(map[string]any{})
 }
 
@@ -797,8 +875,10 @@ func handleUsage(raw []byte) ([]byte, error) {
 			}
 		}
 	}
+	e.LastActivity = time.Now().Unix()
+	snap := snapshotEntry(e)
 	store.Unlock()
-	persistAppend(e)
+	persistAppend(snap)
 	return okEnvelope(map[string]any{"recorded": true})
 }
 
@@ -838,7 +918,9 @@ func handleComplete(raw []byte) ([]byte, error) {
 		e.Requested = c.RequestedModel
 	}
 	e.Stream = c.Stream || e.Stream
-	e.Outcome = c.Outcome
+	if c.Outcome != "" {
+		e.Outcome = c.Outcome
+	}
 	e.Running = false
 	if c.StatusCode != 0 {
 		e.Status = c.StatusCode
@@ -851,8 +933,10 @@ func handleComplete(raw []byte) ([]byte, error) {
 	if e.DurationMs == 0 && !c.StartedAt.IsZero() && !c.CompletedAt.IsZero() {
 		e.DurationMs = c.CompletedAt.Sub(c.StartedAt).Milliseconds()
 	}
+	e.LastActivity = time.Now().Unix()
+	snap := snapshotEntry(e)
 	store.Unlock()
-	persistAppend(e)
+	persistAppend(snap)
 	return okEnvelope(map[string]any{"recorded": true})
 }
 
@@ -862,16 +946,38 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	path := req.Path
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	switch {
 	case strings.HasPrefix(path, "/v0/resource/plugins/request-logs/"):
+		if method != "" && method != http.MethodGet && method != http.MethodHead {
+			return okEnvelope(managementResponseWire{
+				StatusCode: http.StatusMethodNotAllowed,
+				Headers:    map[string][]string{"Content-Type": {"application/json"}},
+				Body:       []byte(`{"error":"method not allowed"}`),
+			})
+		}
 		return okEnvelope(managementResponseWire{
 			StatusCode: http.StatusOK,
 			Headers:    map[string][]string{"Content-Type": {"text/html; charset=utf-8"}},
 			Body:       []byte(pageHTML),
 		})
 	case strings.HasSuffix(path, "/request-logs/entries"):
+		if method != "" && method != http.MethodGet && method != http.MethodHead {
+			return okEnvelope(managementResponseWire{
+				StatusCode: http.StatusMethodNotAllowed,
+				Headers:    map[string][]string{"Content-Type": {"application/json"}},
+				Body:       []byte(`{"error":"method not allowed"}`),
+			})
+		}
 		return entriesJSON()
 	case strings.HasSuffix(path, "/request-logs/clear"):
+		if method != http.MethodPost {
+			return okEnvelope(managementResponseWire{
+				StatusCode: http.StatusMethodNotAllowed,
+				Headers:    map[string][]string{"Content-Type": {"application/json"}},
+				Body:       []byte(`{"error":"POST required"}`),
+			})
+		}
 		store.Lock()
 		store.order = nil
 		store.byID = make(map[string]*logEntry)
@@ -1213,7 +1319,7 @@ function detailRow(e){
  let html='';
  const at=e.attempts||[];
  if(at.length>0){
-  html+='<div class="att"><b>Route:</b> '+(e.requested||'—')+' → '+(at.length>1?'<span style="color:var(--warn)">fell back ×'+(at.length-1)+'</span>':'direct')+'</div>';
+  html+='<div class="att"><b>Route:</b> '+esc(e.requested||'—')+' → '+(at.length>1?'<span style="color:var(--warn)">fell back ×'+(at.length-1)+'</span>':'direct')+'</div>';
   at.forEach((a,i)=>{
    const aInTotal=a.input_total||a.ti;
    const cpct=aInTotal>0&&a.cache_read>0?Math.min(100,a.cache_read*100/aInTotal):0;
