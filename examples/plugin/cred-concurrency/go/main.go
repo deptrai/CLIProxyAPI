@@ -35,6 +35,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,10 +53,22 @@ var currentConfig atomic.Value
 
 // inflight tracks acquired slots per auth ID. Each entry is one acquire timestamp;
 // entries older than the configured TTL are treated as stale leaks and dropped.
+// lastPicked preserves round-robin rotation within each priority tier, but only
+// for providers listed in round_robin_providers; other providers stay fill-first.
 var inflight = struct {
 	sync.Mutex
-	slots map[string][]time.Time
-}{slots: make(map[string][]time.Time)}
+	slots      map[string][]time.Time
+	lastPicked map[string]string
+	// swept counts slots per auth ID that sweepStale reclaimed as leaks. A later
+	// usage record for that auth ID is assumed to belong to a swept (leaked) slot
+	// first, so releaseSlot never pops a live stamp for it. This biases toward
+	// under-admitting (a live slot may be held until TTL) but never over-admits.
+	swept map[string]int
+}{
+	slots:      make(map[string][]time.Time),
+	lastPicked: make(map[string]string),
+	swept:      make(map[string]int),
+}
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -80,8 +93,14 @@ type pluginConfig struct {
 	// record; it only guards against leaks when a picked auth never executes.
 	// Defaults to 30m.
 	SlotTTL string `yaml:"slot_ttl"`
+	// RoundRobinProviders lists provider names that rotate picks within a
+	// priority tier (e.g. to spread quota across accounts). Providers not
+	// listed keep fill-first ordering: the first credential under its cap is
+	// reused, which preserves upstream prefix caching on a single account.
+	RoundRobinProviders []string `yaml:"round_robin_providers"`
 
-	slotTTL time.Duration
+	slotTTL     time.Duration
+	rrProviders map[string]bool
 }
 
 type registration struct {
@@ -183,6 +202,15 @@ func configure(raw []byte) error {
 		}
 		cfg.slotTTL = parsed
 	}
+	if cfg.slotTTL <= 0 {
+		return errors.New("slot_ttl must be a positive duration")
+	}
+	cfg.rrProviders = map[string]bool{}
+	for _, provider := range cfg.RoundRobinProviders {
+		if trimmed := strings.TrimSpace(provider); trimmed != "" {
+			cfg.rrProviders[trimmed] = true
+		}
+	}
 	currentConfig.Store(cfg)
 	return nil
 }
@@ -213,6 +241,11 @@ func pluginRegistration() registration {
 					Name:        "slot_ttl",
 					Type:        pluginapi.ConfigFieldTypeString,
 					Description: "How long an acquired slot may live without a usage record before it is reclaimed (default 30m).",
+				},
+				{
+					Name:        "round_robin_providers",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Providers that rotate picks within a priority tier (e.g. [devin] to spread quota). Unlisted providers keep fill-first order so one credential stays hot for upstream caching.",
 				},
 			},
 		},
@@ -277,6 +310,11 @@ func sweepStale(now time.Time, ttl time.Duration) {
 		} else {
 			inflight.slots[authID] = kept
 		}
+		// Dropped stamps are counted as leaked slots; their usage records (if any
+		// arrive late) must not pop live stamps in releaseSlot.
+		if dropped := len(stamps) - len(kept); dropped > 0 {
+			inflight.swept[authID] += dropped
+		}
 	}
 }
 
@@ -310,14 +348,60 @@ func pickAuth(raw []byte) ([]byte, error) {
 	sort.SliceStable(req.Candidates, func(i, j int) bool {
 		return req.Candidates[i].Priority > req.Candidates[j].Priority
 	})
+
+	type priorityTier struct {
+		priority   int
+		candidates []pluginapi.SchedulerAuthCandidate
+	}
+	var tiers []priorityTier
 	for _, candidate := range req.Candidates {
-		limit := limitFor(cfg, candidate)
-		if limit <= 0 {
-			return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+		if len(tiers) == 0 || tiers[len(tiers)-1].priority != candidate.Priority {
+			tiers = append(tiers, priorityTier{
+				priority:   candidate.Priority,
+				candidates: []pluginapi.SchedulerAuthCandidate{candidate},
+			})
+		} else {
+			tiers[len(tiers)-1].candidates = append(tiers[len(tiers)-1].candidates, candidate)
 		}
-		if int64(len(inflight.slots[candidate.ID])) < limit {
-			inflight.slots[candidate.ID] = append(inflight.slots[candidate.ID], now)
-			return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+	}
+
+	for _, tier := range tiers {
+		m := len(tier.candidates)
+		if m == 0 {
+			continue
+		}
+		rotKey := strconv.Itoa(tier.priority)
+		if len(tier.candidates) > 0 && strings.TrimSpace(tier.candidates[0].Provider) != "" {
+			rotKey = strings.TrimSpace(tier.candidates[0].Provider) + ":" + rotKey
+		}
+		startIdx := 0
+		if cfg.rrProviders[strings.TrimSpace(tier.candidates[0].Provider)] {
+			if lastID, ok := inflight.lastPicked[rotKey]; ok && lastID != "" {
+				for idx, cand := range tier.candidates {
+					if cand.ID == lastID {
+						startIdx = (idx + 1) % m
+						break
+					}
+				}
+			}
+		}
+
+		for i := 0; i < m; i++ {
+			candidate := tier.candidates[(startIdx+i)%m]
+			limit := limitFor(cfg, candidate)
+			if limit <= 0 {
+				if inflight.lastPicked != nil {
+					inflight.lastPicked[rotKey] = candidate.ID
+				}
+				return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+			}
+			if int64(len(inflight.slots[candidate.ID])) < limit {
+				inflight.slots[candidate.ID] = append(inflight.slots[candidate.ID], now)
+				if inflight.lastPicked != nil {
+					inflight.lastPicked[rotKey] = candidate.ID
+				}
+				return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+			}
 		}
 	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
@@ -348,6 +432,16 @@ func releaseSlot(raw []byte) ([]byte, error) {
 	}
 	inflight.Lock()
 	defer inflight.Unlock()
+	// If some slots for this auth were swept as leaks, assume this usage record
+	// belongs to one of those leaked slots and leave the live stamps untouched.
+	// Otherwise pop the oldest live stamp (FIFO) as before.
+	if inflight.swept[authID] > 0 {
+		inflight.swept[authID]--
+		if inflight.swept[authID] <= 0 {
+			delete(inflight.swept, authID)
+		}
+		return okEnvelope(struct{}{})
+	}
 	stamps := inflight.slots[authID]
 	if len(stamps) <= 1 {
 		delete(inflight.slots, authID)

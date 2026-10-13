@@ -8,11 +8,15 @@ priority order.
 
 - `scheduler.pick`: the plugin opts into every priority tier
   (`scheduler_across_priorities`). It sorts by priority, then picks the first
-  candidate under its limit. Credentials without a limit are unlimited, so a
-  lower-priority provider is the fallback once higher tiers are full.
-  If every limited candidate is busy and no unlimited candidate remains, the
-  pick is rejected with `auth_unavailable` so the conductor moves to the next
-  provider group.
+  candidate under its limit (fill-first). Credentials without a limit are
+  unlimited, so a lower-priority provider is the fallback once higher tiers
+  are full. If every limited candidate is busy and no unlimited candidate
+  remains, the pick is rejected with `auth_unavailable` so the conductor moves
+  to the next provider group.
+- Pick order within a tier: fill-first by default — the first credential under
+  its cap is reused, which keeps one account hot for upstream prefix caching.
+  Providers listed in `round_robin_providers` rotate across credentials instead
+  (e.g. to spread a quota pool across accounts).
 - `usage.handle`: every completed `UsageRecord` releases one slot for its
   `AuthID` (fires on success and failure).
 - Leak guard: a slot older than `slot_ttl` without a usage record is reclaimed
@@ -31,6 +35,8 @@ plugins:
     cred-concurrency:
       enabled: true
       slot_ttl: "30m"          # optional, default 30m
+      round_robin_providers:   # optional; unlisted providers stay fill-first
+        - devin
       limits:                  # optional per-auth overrides
         devin-account-a.json: 1
         devin-account-b.json: 3
