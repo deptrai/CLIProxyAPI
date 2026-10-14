@@ -58,6 +58,13 @@ func looksLikeOpenAIResponsesSSE(payload []byte) bool {
 }
 
 func runWebSearchStreamOrchestration(ctx context.Context, exec pluginapi.ExecutorRequest, hostCallbackID, pluginStreamID string) error {
+	if isRawSearchAPIRequest(exec) {
+		payload, errRun := runRawSearchAPI(ctx, exec)
+		if errRun != nil {
+			return errRun
+		}
+		return emitPluginStreamChunk(pluginStreamID, payload)
+	}
 	cfg := loadedConfig()
 	req := pluginapi.ModelRouteRequest{
 		SourceFormat:       "claude",
@@ -87,8 +94,30 @@ func runOrderedExecutionPlansStream(ctx context.Context, exec pluginapi.Executor
 	for _, backend := range ordered {
 		plan := planByBackend[backend]
 		switch backend {
+		case backendSearXNG:
+			payload, _, errRun := runSearXNGClaudeStreamWithClient(ctx, exec, newSearXNGClient(cfg.searxngURLs()))
+			if errRun != nil {
+				lastErr = errRun
+				continue
+			}
+			if errEmit := emitPluginStreamChunk(pluginStreamID, payload); errEmit != nil {
+				return errEmit
+			}
+			recordBackendSuccess(backend)
+			return nil
 		case backendTavily:
 			payload, _, errRun := runTavilyClaudeStreamWithClient(ctx, exec, newTavilyClient(cfg.TavilyAPIKeys))
+			if errRun != nil {
+				lastErr = errRun
+				continue
+			}
+			if errEmit := emitPluginStreamChunk(pluginStreamID, payload); errEmit != nil {
+				return errEmit
+			}
+			recordBackendSuccess(backend)
+			return nil
+		case backendBrave:
+			payload, _, errRun := runBraveClaudeStreamWithClient(ctx, exec, newBraveClient(cfg.BraveAPIKeys))
 			if errRun != nil {
 				lastErr = errRun
 				continue
