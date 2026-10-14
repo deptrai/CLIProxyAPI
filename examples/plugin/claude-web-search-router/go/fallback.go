@@ -12,7 +12,9 @@ func defaultWebSearchFallbackChain() []routeBackend {
 		backendAntigravityGoogle,
 		backendCodexWebSearch,
 		backendXAIWebSearch,
+		backendSearXNG,
 		backendTavily,
+		backendBrave,
 	}
 }
 
@@ -24,6 +26,16 @@ func isFallbackRoute(route string) bool {
 // tryRouteBackend returns a handled ModelRouteResponse and true when this backend can serve the request.
 func tryRouteBackend(backend routeBackend, cfg pluginConfig, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
 	switch backend {
+	case backendSearXNG:
+		client := newSearXNGClient(cfg.searxngURLs())
+		if !client.available() {
+			return pluginapi.ModelRouteResponse{Handled: false, Reason: "searxng_unavailable"}, false
+		}
+		return pluginapi.ModelRouteResponse{
+			Handled:    true,
+			TargetKind: pluginapi.ModelRouteTargetSelf,
+			Reason:     "claude_code_web_search_searxng",
+		}, true
 	case backendTavily:
 		client := newTavilyClient(cfg.TavilyAPIKeys)
 		if !client.available() {
@@ -33,6 +45,16 @@ func tryRouteBackend(backend routeBackend, cfg pluginConfig, req pluginapi.Model
 			Handled:    true,
 			TargetKind: pluginapi.ModelRouteTargetSelf,
 			Reason:     "claude_code_web_search_tavily",
+		}, true
+	case backendBrave:
+		client := newBraveClient(cfg.BraveAPIKeys)
+		if !client.available() {
+			return pluginapi.ModelRouteResponse{Handled: false, Reason: "brave_unavailable"}, false
+		}
+		return pluginapi.ModelRouteResponse{
+			Handled:    true,
+			TargetKind: pluginapi.ModelRouteTargetSelf,
+			Reason:     "claude_code_web_search_brave",
 		}, true
 	case backendAntigravityGoogle:
 		if !hasProvider(req.AvailableProviders, "antigravity") {

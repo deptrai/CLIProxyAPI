@@ -13,10 +13,23 @@ This plugin demonstrates **ModelRouter** on Claude Code built-in `web_search` re
 
 | Value                    | Behavior                                                                                                                                                                                                                                                                                                  |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fallback` (**default**) | Plugin **executor** runs **antigravity → codex → xai → tavily** (built-ins via `host.model.*`, Tavily in-plugin). On **429/503/502**, tries the next backend in the same request. Backends that fail often are **deprioritized on later requests** (in-memory penalty; no extra config). |
-| `antigravity_google` / `codex_web_search` / `xai_web_search` / `tavily` | Same orchestration for that backend’s chain member(s): execution retry + penalty apply when multiple backends are eligible. |
+| `fallback` (**default**) | Plugin **executor** runs **antigravity → codex → xai → searxng → tavily → brave** (built-ins via `host.model.*`, SearXNG/Tavily/Brave in-plugin). On **429/503/502**, tries the next backend in the same request. Backends that fail often are **deprioritized on later requests** (in-memory penalty; no extra config). |
+| `antigravity_google` / `codex_web_search` / `xai_web_search` / `searxng` / `tavily` / `brave` | Same orchestration for that backend’s chain member(s): execution retry + penalty apply when multiple backends are eligible. |
 | `default_provider`             | `default_provider` + optional `default_provider_model` via built-in AuthManager (not orchestrated).                                                                                                                                                                                                                          |
-Routing for `fallback` requires at least one runnable backend (providers in `AvailableProviders` where needed, resolvable antigravity model, or `tavily_api_keys`).
+Routing for `fallback` requires at least one runnable backend (providers in `AvailableProviders` where needed, resolvable antigravity model, `searxng_url`, `tavily_api_keys`, or `brave_api_keys`).
+
+### SearXNG notes (self-hosted, no API key)
+
+- **Endpoint**: `GET {searxng_url}/search?q=<query>&format=json`. The instance must have JSON output enabled in `settings.yml` (`search.formats: [html, json]`), otherwise SearXNG replies `403`.
+- **Multiple instances**: `searxng_urls` accepts a list; requests rotate the starting instance and fail over to the next URL on error. `searxng_url` (single) is still supported and is tried first.
+- **Answer**: uses the first non-empty entry of SearXNG `answers[]`; when absent, the result list is composed into the reply text.
+- **Results**: capped at the request's `max_uses` (default 5).
+
+### Brave Search notes
+
+- **Endpoint**: `GET https://api.search.brave.com/res/v1/web/search?q=<query>&count=<n>` with `X-Subscription-Token` (round-robin across `brave_api_keys`).
+- **Answer**: Brave returns no direct answer; the result list is composed into the reply text.
+- **Results**: `count` is capped at 20 (Brave API maximum per request).
 
 ### xAI web search notes (aligned with upstream docs)
 
@@ -32,7 +45,7 @@ Plugin config lives under `plugins.configs.claude-web-search-router` (key must m
 
 ### Recommended: fallback chain (default)
 
-Tries **antigravity → codex → xai → tavily**; configure `tavily_api_keys` so the last step can succeed when built-in providers are missing or unavailable.
+Tries **antigravity → codex → xai → searxng → tavily → brave**; configure `searxng_url` (free, self-hosted) and/or `tavily_api_keys` / `brave_api_keys` so a late step can succeed when built-in providers are missing or unavailable.
 
 ```yaml
 plugins:
@@ -46,9 +59,12 @@ plugins:
       antigravity_model: "" # empty: registry lookup, then first supports_web_search
       codex_model: "gpt-5.4-mini"
       xai_model: "grok-4.3"
+      searxng_url: "http://127.0.0.1:8888" # optional self-hosted SearXNG (JSON format enabled)
       tavily_api_keys:
         - "tvly-xxxxxxxx"
         # - "tvly-yyyyyyyy" # optional: round-robin
+      brave_api_keys:
+        # - "BSAxxxxxxxx" # optional: round-robin
       require_web_search_only: true
 ```
 
@@ -123,6 +139,33 @@ plugins:
       require_web_search_only: true
 ```
 
+**SearXNG only (plugin executor, self-hosted):**
+
+```yaml
+plugins:
+  configs:
+    claude-web-search-router:
+      enabled: true
+      priority: 20
+      route: searxng
+      searxng_url: "http://127.0.0.1:8888"
+      require_web_search_only: true
+```
+
+**Brave only (plugin executor):**
+
+```yaml
+plugins:
+  configs:
+    claude-web-search-router:
+      enabled: true
+      priority: 20
+      route: brave
+      brave_api_keys:
+        - "BSAxxxxxxxx"
+      require_web_search_only: true
+```
+
 **Built-in provider via `default_provider`:**
 
 ```yaml
@@ -158,12 +201,14 @@ plugins:
 | ----- | ----------- |
 | `enabled` | `false` → `Handled: false` for all web_search matches |
 | `priority` | Host plugin order for ModelRouter (higher runs earlier; see main repo plugins docs) |
-| `route` | `fallback` (default), `antigravity_google`, `codex_web_search`, `xai_web_search`, `tavily`, `default_provider` |
+| `route` | `fallback` (default), `antigravity_google`, `codex_web_search`, `xai_web_search`, `searxng`, `tavily`, `brave`, `default_provider` |
 | `antigravity_model` | Antigravity execution model; never the client Claude model name |
 | `codex_model` | Codex model; empty → `gpt-5.4-mini` |
 | `xai_model` | xAI model; empty → `grok-4.3` |
 | `default_provider` / `default_provider_model` | Used when `route=default_provider` |
+| `searxng_url` / `searxng_urls` | Self-hosted SearXNG base URL(s) (JSON format enabled); used for `route=searxng` or as a fallback member. `searxng_urls` rotates + fails over |
 | `tavily_api_keys` | Required for `route=tavily` or fallback last step |
+| `brave_api_keys` | Required for `route=brave` or as a fallback member (round-robin) |
 | `require_web_search_only` | `true` matches Claude Code–style exclusive `web_search` tools |
 
 ## Build

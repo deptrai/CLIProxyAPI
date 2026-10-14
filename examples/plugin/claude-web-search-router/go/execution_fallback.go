@@ -48,8 +48,18 @@ func executionPlansForExecuteRoute(cfg pluginConfig, req pluginapi.ModelRouteReq
 		plans = append(plans, executionPlan{backend: backend, model: resolveCodexWebSearchTargetModel(cfg.CodexModel)})
 	case backendXAIWebSearch:
 		plans = append(plans, executionPlan{backend: backend, model: resolveXAIWebSearchTargetModel(cfg.XAIModel)})
+	case backendSearXNG:
+		if !newSearXNGClient(cfg.searxngURLs()).available() {
+			return nil
+		}
+		plans = append(plans, executionPlan{backend: backend})
 	case backendTavily:
 		if !newTavilyClient(cfg.TavilyAPIKeys).available() {
+			return nil
+		}
+		plans = append(plans, executionPlan{backend: backend})
+	case backendBrave:
+		if !newBraveClient(cfg.BraveAPIKeys).available() {
 			return nil
 		}
 		plans = append(plans, executionPlan{backend: backend})
@@ -85,7 +95,11 @@ func buildExecutionPlansInternal(cfg pluginConfig, req pluginapi.ModelRouteReque
 				backend: backend,
 				model:   resolveXAIWebSearchTargetModel(cfg.XAIModel),
 			})
+		case backendSearXNG:
+			plans = append(plans, executionPlan{backend: backend})
 		case backendTavily:
+			plans = append(plans, executionPlan{backend: backend})
+		case backendBrave:
 			plans = append(plans, executionPlan{backend: backend})
 		default:
 			continue
@@ -96,8 +110,12 @@ func buildExecutionPlansInternal(cfg pluginConfig, req pluginapi.ModelRouteReque
 
 func backendRunnableLenient(backend routeBackend, cfg pluginConfig, req pluginapi.ModelRouteRequest) bool {
 	switch backend {
+	case backendSearXNG:
+		return newSearXNGClient(cfg.searxngURLs()).available()
 	case backendTavily:
 		return newTavilyClient(cfg.TavilyAPIKeys).available()
+	case backendBrave:
+		return newBraveClient(cfg.BraveAPIKeys).available()
 	case backendAntigravityGoogle:
 		return resolveAntigravityWebSearchTargetModel(cfg.AntigravityModel, req.RequestedModel) != ""
 	case backendCodexWebSearch, backendXAIWebSearch:
@@ -127,7 +145,11 @@ func executionPlansForRoute(cfg pluginConfig, req pluginapi.ModelRouteRequest, r
 			plans = append(plans, executionPlan{backend: b, model: resolveCodexWebSearchTargetModel(cfg.CodexModel)})
 		case backendXAIWebSearch:
 			plans = append(plans, executionPlan{backend: b, model: resolveXAIWebSearchTargetModel(cfg.XAIModel)})
+		case backendSearXNG:
+			plans = append(plans, executionPlan{backend: b})
 		case backendTavily:
+			plans = append(plans, executionPlan{backend: b})
+		case backendBrave:
 			plans = append(plans, executionPlan{backend: b})
 		}
 	}
@@ -183,14 +205,47 @@ func runOrderedExecutionPlans(ctx context.Context, exec pluginapi.ExecutorReques
 	for _, backend := range ordered {
 		plan := planByBackend[backend]
 		switch backend {
-		case backendTavily:
+		case backendSearXNG:
+			client := newSearXNGClient(cfg.searxngURLs())
 			var payload []byte
 			var headers http.Header
 			var errRun error
 			if stream {
-				payload, headers, errRun = runTavilyClaudeStreamWithClient(ctx, exec, newTavilyClient(cfg.TavilyAPIKeys))
+				payload, headers, errRun = runSearXNGClaudeStreamWithClient(ctx, exec, client)
 			} else {
-				payload, headers, errRun = runTavilyClaudeWithClient(ctx, exec, newTavilyClient(cfg.TavilyAPIKeys))
+				payload, headers, errRun = runSearXNGClaudeWithClient(ctx, exec, client)
+			}
+			if errRun != nil {
+				lastErr = errRun
+				continue
+			}
+			recordBackendSuccess(backend)
+			return payload, headers, nil
+		case backendTavily:
+			client := newTavilyClient(cfg.TavilyAPIKeys)
+			var payload []byte
+			var headers http.Header
+			var errRun error
+			if stream {
+				payload, headers, errRun = runTavilyClaudeStreamWithClient(ctx, exec, client)
+			} else {
+				payload, headers, errRun = runTavilyClaudeWithClient(ctx, exec, client)
+			}
+			if errRun != nil {
+				lastErr = errRun
+				continue
+			}
+			recordBackendSuccess(backend)
+			return payload, headers, nil
+		case backendBrave:
+			client := newBraveClient(cfg.BraveAPIKeys)
+			var payload []byte
+			var headers http.Header
+			var errRun error
+			if stream {
+				payload, headers, errRun = runBraveClaudeStreamWithClient(ctx, exec, client)
+			} else {
+				payload, headers, errRun = runBraveClaudeWithClient(ctx, exec, client)
 			}
 			if errRun != nil {
 				lastErr = errRun
