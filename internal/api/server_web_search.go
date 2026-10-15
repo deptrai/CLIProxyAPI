@@ -25,10 +25,22 @@ func (s *Server) webSearchHandler(c *gin.Context) {
 		return
 	}
 	var apiReq struct {
-		Query string `json:"query"`
+		Query      string `json:"query"`
+		TimeRange  string `json:"time_range"`
+		SafeSearch *int   `json:"safesearch"`
 	}
 	if errUnmarshal := json.Unmarshal(raw, &apiReq); errUnmarshal != nil || strings.TrimSpace(apiReq.Query) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "query is required", "type": "invalid_request_error"}})
+		return
+	}
+	switch apiReq.TimeRange {
+	case "", "day", "week", "month", "year":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "time_range must be one of day|week|month|year", "type": "invalid_request_error"}})
+		return
+	}
+	if apiReq.SafeSearch != nil && (*apiReq.SafeSearch < 0 || *apiReq.SafeSearch > 2) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "safesearch must be 0, 1 or 2", "type": "invalid_request_error"}})
 		return
 	}
 	host := s.pluginHost
