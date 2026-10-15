@@ -188,3 +188,28 @@ func TestRunBraveClaudeJSONWithMock(t *testing.T) {
 		t.Fatalf("web_search_requests = %d", root.Get("usage.server_tool_use.web_search_requests").Int())
 	}
 }
+
+func TestBraveClientOptionsMapping(t *testing.T) {
+	var gotLang, gotFreshness, gotSafe string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotLang, gotFreshness, gotSafe = q.Get("search_lang"), q.Get("freshness"), q.Get("safesearch")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"web":{"results":[{"title":"T","url":"https://e.com","description":"d"}]}}`))
+	}))
+	defer server.Close()
+
+	prev := braveSearchURL
+	braveSearchURL = server.URL
+	defer func() { braveSearchURL = prev }()
+
+	client := newBraveClientWithOptions([]string{"k"}, server.Client(), server.URL)
+	safe := 1
+	opts := searchOptions{Language: "vi", TimeRange: "day", SafeSearch: &safe}
+	if _, _, errSearch := client.searchOpts(context.Background(), "q", 5, opts); errSearch != nil {
+		t.Fatalf("searchOpts() error = %v", errSearch)
+	}
+	if gotLang != "vi" || gotFreshness != "pd" || gotSafe != "moderate" {
+		t.Fatalf("params = lang:%q freshness:%q safe:%q", gotLang, gotFreshness, gotSafe)
+	}
+}

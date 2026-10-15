@@ -66,6 +66,23 @@ type tavilySearchRequest struct {
 	SearchDepth   string `json:"search_depth,omitempty"`
 	MaxResults    int    `json:"max_results,omitempty"`
 	IncludeAnswer bool   `json:"include_answer,omitempty"`
+	Days          int    `json:"days,omitempty"`
+}
+
+// tavilyDays maps the generic time_range values to Tavily's days-back window.
+func tavilyDays(timeRange string) int {
+	switch timeRange {
+	case "day":
+		return 1
+	case "week":
+		return 7
+	case "month":
+		return 30
+	case "year":
+		return 365
+	default:
+		return 0
+	}
 }
 
 type tavilySearchResponse struct {
@@ -84,6 +101,10 @@ type claudeWebSearchHit struct {
 }
 
 func (c *tavilyClient) search(ctx context.Context, query string, maxResults int) ([]claudeWebSearchHit, string, error) {
+	return c.searchOpts(ctx, query, maxResults, searchOptions{})
+}
+
+func (c *tavilyClient) searchOpts(ctx context.Context, query string, maxResults int, opts searchOptions) ([]claudeWebSearchHit, string, error) {
 	if !c.available() {
 		return nil, "", fmt.Errorf("tavily_api_keys is empty")
 	}
@@ -100,6 +121,7 @@ func (c *tavilyClient) search(ctx context.Context, query string, maxResults int)
 		SearchDepth:   "basic",
 		MaxResults:    maxResults,
 		IncludeAnswer: true,
+		Days:          tavilyDays(opts.TimeRange),
 	})
 	if errMarshal != nil {
 		return nil, "", errMarshal

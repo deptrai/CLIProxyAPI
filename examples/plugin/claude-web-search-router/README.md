@@ -218,3 +218,35 @@ make -C examples/plugin bin/claude-web-search-router-go.dylib
 ```
 
 Use `.so` on Linux and `.dll` on Windows. Point `plugins.path` at the built artifact.
+
+## Raw search API (`POST /v1/search`)
+
+The core server exposes `POST /v1/search` (same API-key auth as `/v1/messages`)
+which dispatches into this plugin's raw-search mode — plain JSON results, no
+LLM conversation required. Optional request fields are forwarded per backend:
+
+```json
+{
+  "query": "nestjs dependency injection",
+  "max_results": 8,
+  "language": "vi",
+  "time_range": "week",
+  "safesearch": 1,
+  "engines": "google,bing",
+  "categories": "general"
+}
+```
+
+| Field | SearXNG | Brave | Tavily |
+| ----- | ------- | ----- | ------ |
+| `language` | `language=` (omit for `auto`) | `search_lang=` | ignored |
+| `time_range` | `time_range=` (`day\|week\|month\|year`) | `freshness=` (`pd\|pw\|pm\|py`) | `days=` (1/7/30/365) |
+| `safesearch` | `safesearch=0\|1\|2` | `safesearch=off\|moderate\|strict` | ignored |
+| `engines` | `engines=` (raw, comma-separated) | ignored | ignored |
+| `categories` | `categories=` (raw) | ignored | ignored |
+
+All fields are optional; omitted fields produce the same upstream request as
+before (backward compatible). Invalid `time_range`/`safesearch` values are
+rejected with HTTP 400 by the core handler. The response adds
+`backend_detail` (host of the SearXNG instance that served the request, no
+credentials) when SearXNG handled it.
