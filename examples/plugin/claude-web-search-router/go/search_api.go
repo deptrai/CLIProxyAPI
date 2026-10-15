@@ -11,9 +11,24 @@ import (
 
 const webSearchAPIModel = "web-search"
 
+// searchOptions carries optional search modifiers understood by the raw
+// search API; backends apply what they support and ignore the rest.
+type searchOptions struct {
+	Language   string
+	TimeRange  string
+	SafeSearch *int
+	Engines    string
+	Categories string
+}
+
 type rawSearchAPIRequest struct {
 	Query      string `json:"query"`
 	MaxResults int    `json:"max_results"`
+	Language   string `json:"language,omitempty"`
+	TimeRange  string `json:"time_range,omitempty"`
+	SafeSearch *int   `json:"safesearch,omitempty"`
+	Engines    string `json:"engines,omitempty"`
+	Categories string `json:"categories,omitempty"`
 }
 
 type rawSearchHit struct {
@@ -23,11 +38,14 @@ type rawSearchHit struct {
 }
 
 type rawSearchResponse struct {
-	Query   string         `json:"query"`
-	Answer  string         `json:"answer,omitempty"`
-	Backend string         `json:"backend"`
-	Results []rawSearchHit `json:"results"`
+	Query         string         `json:"query"`
+	Answer        string         `json:"answer,omitempty"`
+	Backend       string         `json:"backend"`
+	BackendDetail string         `json:"backend_detail,omitempty"`
+	Results       []rawSearchHit `json:"results"`
 }
+
+var validTimeRanges = map[string]bool{"day": true, "week": true, "month": true, "year": true}
 
 // isRawSearchAPIBody reports whether the payload is a raw search API request
 // ({"query": "..."} without the claude messages/tools envelope).
@@ -84,18 +102,32 @@ func runRawSearchAPI(ctx context.Context, req pluginapi.ExecutorRequest) ([]byte
 	if maxResults > 20 {
 		maxResults = 20
 	}
+	if apiReq.TimeRange != "" && !validTimeRanges[apiReq.TimeRange] {
+		return nil, fmt.Errorf("time_range must be one of day|week|month|year")
+	}
+	if apiReq.SafeSearch != nil && (*apiReq.SafeSearch < 0 || *apiReq.SafeSearch > 2) {
+		return nil, fmt.Errorf("safesearch must be 0, 1 or 2")
+	}
+	opts := searchOptions{
+		Language:   strings.TrimSpace(apiReq.Language),
+		TimeRange:  apiReq.TimeRange,
+		SafeSearch: apiReq.SafeSearch,
+		Engines:    strings.TrimSpace(apiReq.Engines),
+		Categories: strings.TrimSpace(apiReq.Categories),
+	}
 	backends := rawSearchBackends(cfg)
 	if len(backends) == 0 {
 		return nil, fmt.Errorf("web search api: no search backend configured")
 	}
-	searchers := map[routeBackend]func(context.Context, string, int) ([]claudeWebSearchHit, string, error){
-		backendSearXNG: newSearXNGClient(cfg.searxngURLs()).search,
-		backendTavily:  newTavilyClient(cfg.TavilyAPIKeys).search,
-		backendBrave:   newBraveClient(cfg.BraveAPIKeys).search,
+	searxng := newSearXNGClient(cfg.searxngURLs())
+	searchers := map[routeBackend]func(context.Context, string, int, searchOptions) ([]claudeWebSearchHit, string, error){
+		backendSearXNG: searxng.searchOpts,
+		backendTavily:  newTavilyClient(cfg.TavilyAPIKeys).searchOpts,
+		backendBrave:   newBraveClient(cfg.BraveAPIKeys).searchOpts,
 	}
 	var lastErr error
 	for _, backend := range sortBackendsByPenalty(backends) {
-		hits, answer, errSearch := searchers[backend](ctx, query, maxResults)
+		hits, answer, errSearch := searchers[backend](ctx, query, maxResults, opts)
 		if errSearch != nil {
 			lastErr = errSearch
 			continue
@@ -106,6 +138,9 @@ func runRawSearchAPI(ctx context.Context, req pluginapi.ExecutorRequest) ([]byte
 			Answer:  answer,
 			Backend: string(backend),
 			Results: make([]rawSearchHit, 0, len(hits)),
+		}
+		if backend == backendSearXNG {
+			resp.BackendDetail = searxng.lastBackendHost()
 		}
 		for _, h := range hits {
 			resp.Results = append(resp.Results, rawSearchHit{Title: h.Title, URL: h.URL, Snippet: h.Snippet})

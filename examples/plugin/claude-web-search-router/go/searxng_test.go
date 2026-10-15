@@ -226,3 +226,66 @@ func TestRunSearXNGClaudeJSONWithMock(t *testing.T) {
 		t.Fatalf("web_search_requests = %d", root.Get("usage.server_tool_use.web_search_requests").Int())
 	}
 }
+
+func TestSearXNGClientOptionsPassthrough(t *testing.T) {
+	var gotLang, gotRange, gotSafe, gotEngines, gotCats string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotLang, gotRange, gotSafe = q.Get("language"), q.Get("time_range"), q.Get("safesearch")
+		gotEngines, gotCats = q.Get("engines"), q.Get("categories")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	client := newSearXNGClientWithOptions([]string{server.URL}, server.Client())
+	safe := 1
+	opts := searchOptions{Language: "vi", TimeRange: "week", SafeSearch: &safe, Engines: "google,bing", Categories: "general"}
+	if _, _, errSearch := client.searchOpts(context.Background(), "q", 5, opts); errSearch != nil {
+		t.Fatalf("searchOpts() error = %v", errSearch)
+	}
+	if gotLang != "vi" || gotRange != "week" || gotSafe != "1" || gotEngines != "google,bing" || gotCats != "general" {
+		t.Fatalf("params = lang:%q range:%q safe:%q engines:%q cats:%q", gotLang, gotRange, gotSafe, gotEngines, gotCats)
+	}
+}
+
+func TestSearXNGClientOptionsOmittedAndAuto(t *testing.T) {
+	var gotLang, gotRange, gotSafe, gotEngines, gotCats string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotLang, gotRange, gotSafe = q.Get("language"), q.Get("time_range"), q.Get("safesearch")
+		gotEngines, gotCats = q.Get("engines"), q.Get("categories")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	client := newSearXNGClientWithOptions([]string{server.URL}, server.Client())
+	if _, _, errSearch := client.searchOpts(context.Background(), "q", 5, searchOptions{Language: "auto"}); errSearch != nil {
+		t.Fatalf("searchOpts() error = %v", errSearch)
+	}
+	if gotLang != "" || gotRange != "" || gotSafe != "" || gotEngines != "" || gotCats != "" {
+		t.Fatalf("expected all optional params omitted, got lang:%q range:%q safe:%q engines:%q cats:%q", gotLang, gotRange, gotSafe, gotEngines, gotCats)
+	}
+}
+
+func TestSearXNGLastBackendHostStripsCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	authed := "http://user:secret@" + strings.TrimPrefix(server.URL, "http://")
+	client := newSearXNGClientWithOptions([]string{authed}, server.Client())
+	if _, _, errSearch := client.search(context.Background(), "q", 5); errSearch != nil {
+		t.Fatalf("search() error = %v", errSearch)
+	}
+	host := client.lastBackendHost()
+	if host == "" || strings.Contains(host, "secret") || strings.Contains(host, "user:") {
+		t.Fatalf("lastBackendHost() = %q, want bare host without credentials", host)
+	}
+	if host != strings.TrimPrefix(server.URL, "http://") {
+		t.Fatalf("lastBackendHost() = %q, want %q", host, strings.TrimPrefix(server.URL, "http://"))
+	}
+}

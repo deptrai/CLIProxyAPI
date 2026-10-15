@@ -61,6 +61,35 @@ func (c *braveClient) nextKey() string {
 	return c.keys[int(n-1)%len(c.keys)]
 }
 
+// braveFreshness maps the generic time_range values to Brave's freshness codes.
+func braveFreshness(timeRange string) string {
+	switch timeRange {
+	case "day":
+		return "pd"
+	case "week":
+		return "pw"
+	case "month":
+		return "pm"
+	case "year":
+		return "py"
+	default:
+		return ""
+	}
+}
+
+// braveSafeSearch maps SearXNG-style 0|1|2 safesearch levels to Brave's
+// off|moderate|strict values.
+func braveSafeSearch(level int) string {
+	switch level {
+	case 1:
+		return "moderate"
+	case 2:
+		return "strict"
+	default:
+		return "off"
+	}
+}
+
 type braveSearchResponse struct {
 	Web struct {
 		Results []struct {
@@ -72,6 +101,10 @@ type braveSearchResponse struct {
 }
 
 func (c *braveClient) search(ctx context.Context, query string, maxResults int) ([]claudeWebSearchHit, string, error) {
+	return c.searchOpts(ctx, query, maxResults, searchOptions{})
+}
+
+func (c *braveClient) searchOpts(ctx context.Context, query string, maxResults int, opts searchOptions) ([]claudeWebSearchHit, string, error) {
 	if !c.available() {
 		return nil, "", fmt.Errorf("brave_api_keys is empty")
 	}
@@ -85,7 +118,17 @@ func (c *braveClient) search(ctx context.Context, query string, maxResults int) 
 	if maxResults > 20 {
 		maxResults = 20
 	}
-	endpoint := c.searchEndpoint() + "?" + url.Values{"q": {query}, "count": {fmt.Sprintf("%d", maxResults)}}.Encode()
+	v := url.Values{"q": {query}, "count": {fmt.Sprintf("%d", maxResults)}}
+	if opts.Language != "" && opts.Language != "auto" {
+		v.Set("search_lang", opts.Language)
+	}
+	if f := braveFreshness(opts.TimeRange); f != "" {
+		v.Set("freshness", f)
+	}
+	if opts.SafeSearch != nil {
+		v.Set("safesearch", braveSafeSearch(*opts.SafeSearch))
+	}
+	endpoint := c.searchEndpoint() + "?" + v.Encode()
 	req, errNew := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if errNew != nil {
 		return nil, "", errNew

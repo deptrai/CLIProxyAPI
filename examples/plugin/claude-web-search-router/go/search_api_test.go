@@ -140,3 +140,55 @@ func TestRunRawSearchAPIMaxResultsCap(t *testing.T) {
 		t.Fatalf("query = %q", gotQuery)
 	}
 }
+
+func TestRunRawSearchAPIOptionsForwarded(t *testing.T) {
+	resetBackendPenaltiesForTest()
+	var gotLang, gotRange, gotSafe, gotEngines, gotCats string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		gotLang, gotRange, gotSafe = q.Get("language"), q.Get("time_range"), q.Get("safesearch")
+		gotEngines, gotCats = q.Get("engines"), q.Get("categories")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"T","url":"https://e.com","content":"c"}]}`))
+	}))
+	defer server.Close()
+
+	currentConfig.Store(pluginConfig{
+		Route:       string(backendSearXNG),
+		SearXNGURLs: []string{server.URL},
+	})
+	payload, errRun := runRawSearchAPI(context.Background(), pluginapi.ExecutorRequest{
+		Model:   webSearchAPIModel,
+		Payload: []byte(`{"query":"q","language":"vi","time_range":"month","safesearch":2,"engines":"google","categories":"news"}`),
+	})
+	if errRun != nil {
+		t.Fatalf("runRawSearchAPI() error = %v", errRun)
+	}
+	if gotLang != "vi" || gotRange != "month" || gotSafe != "2" || gotEngines != "google" || gotCats != "news" {
+		t.Fatalf("params = lang:%q range:%q safe:%q engines:%q cats:%q", gotLang, gotRange, gotSafe, gotEngines, gotCats)
+	}
+	text := string(payload)
+	if !strings.Contains(text, `"backend_detail":"`) {
+		t.Fatalf("raw response missing backend_detail in:\n%s", text)
+	}
+}
+
+func TestRunRawSearchAPIInvalidOptions(t *testing.T) {
+	resetBackendPenaltiesForTest()
+	currentConfig.Store(pluginConfig{
+		Route:       string(backendSearXNG),
+		SearXNGURLs: []string{"http://127.0.0.1:1"},
+	})
+	if _, errRun := runRawSearchAPI(context.Background(), pluginapi.ExecutorRequest{
+		Model:   webSearchAPIModel,
+		Payload: []byte(`{"query":"q","time_range":"fortnight"}`),
+	}); errRun == nil || !strings.Contains(errRun.Error(), "time_range") {
+		t.Fatalf("expected time_range validation error, got %v", errRun)
+	}
+	if _, errRun := runRawSearchAPI(context.Background(), pluginapi.ExecutorRequest{
+		Model:   webSearchAPIModel,
+		Payload: []byte(`{"query":"q","safesearch":5}`),
+	}); errRun == nil || !strings.Contains(errRun.Error(), "safesearch") {
+		t.Fatalf("expected safesearch validation error, got %v", errRun)
+	}
+}
