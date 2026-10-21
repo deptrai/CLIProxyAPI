@@ -480,6 +480,27 @@ func executorForAuth(executor ProviderExecutor, auth *Auth) ProviderExecutor {
 	return executor
 }
 
+// publishUnexecutedPick emits a failure usage record when a selected auth never
+// reaches executor invocation (no compatible models, auth preparation errors,
+// interceptor rejection). Scheduler plugins that meter concurrency via
+// usage.handle rely on one usage record per scheduler.pick; without this record
+// a stamped slot would linger until its TTL.
+func publishUnexecutedPick(ctx context.Context, auth *Auth, provider, model, reason string) {
+	if auth == nil {
+		return
+	}
+	coreusage.PublishRecord(ctx, coreusage.Record{
+		Provider:    strings.TrimSpace(provider),
+		Model:       strings.TrimSpace(model),
+		AuthID:      auth.ID,
+		AuthType:    auth.AuthKind(),
+		Source:      auth.AuthSourceKind(),
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Fail:        coreusage.Failure{Body: reason},
+	})
+}
+
 func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, retryRound int, defaultRequestRetry int) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -534,12 +555,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			publishUnexecutedPick(execCtx, auth, provider, routeModel, "no compatible execution models")
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			publishUnexecutedPick(execCtx, auth, provider, routeModel, "auth preparation failed")
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -554,6 +577,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		executor = executorForAuth(executor, auth)
 		var authErr error
+		executed := false
 		didRefreshOnUnauthorized := false
 		for _, upstreamModel := range models {
 			execCtx = newUpstreamAttemptContext(execCtx)
@@ -587,6 +611,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				if !executed {
+					publishUnexecutedPick(execCtx, auth, provider, routeModel, "request interceptor rejected")
+				}
 				return cliproxyexecutor.Response{}, errIntercept
 			}
 			execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, upstreamModel, restoreExecutionModel)
@@ -594,6 +621,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			executed = true
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
 			if errExec != nil {
@@ -748,12 +776,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			publishUnexecutedPick(execCtx, auth, provider, routeModel, "no compatible execution models")
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			publishUnexecutedPick(execCtx, auth, provider, routeModel, "auth preparation failed")
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -768,6 +798,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		executor = executorForAuth(executor, auth)
 		var authErr error
+		executed := false
 		didRefreshOnUnauthorized := false
 		for _, upstreamModel := range models {
 			execCtx = newUpstreamAttemptContext(execCtx)
@@ -801,6 +832,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			var errIntercept error
 			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			if errIntercept != nil {
+				if !executed {
+					publishUnexecutedPick(execCtx, auth, provider, routeModel, "request interceptor rejected")
+				}
 				return cliproxyexecutor.Response{}, errIntercept
 			}
 			execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, upstreamModel, restoreExecutionModel)
@@ -808,6 +842,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+			executed = true
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
 			if errExec != nil {
@@ -1073,6 +1108,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			aliasResult.OriginalAlias = responseAlias
 		}
 		if len(models) == 0 {
+			publishUnexecutedPick(execCtx, auth, provider, routeModel, "no compatible execution models")
 			if selection != nil {
 				homeExcludedAuthIDs[auth.ID] = struct{}{}
 				lastHomeAuthID = auth.ID
@@ -1092,6 +1128,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		}
 		if errPrepare != nil {
+			publishUnexecutedPick(execCtx, auth, provider, routeModel, "auth preparation failed")
 			if selection != nil {
 				excludeAuth := shouldExcludeHomeAuthAfterStreamError(execCtx, auth, errPrepare)
 				if homeSameAuthRetries[auth.ID] > 0 {

@@ -235,6 +235,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
 	var upstreamErr error
+	executed := false
 	didRefreshOnUnauthorized := false
 	for idx, execModel := range execModels {
 		ctx = newUpstreamAttemptContext(ctx)
@@ -248,10 +249,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		var errIntercept error
 		execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		if errIntercept != nil {
+			if !executed {
+				publishUnexecutedPick(ctx, auth, provider, routeModel, "request interceptor rejected")
+			}
 			return nil, errIntercept
 		}
 		execReq = attachResolvedExecutionModelInfo(routing, execReq, auth, routeModel, execModel, executionModel != "")
 		if errCtx := ctx.Err(); errCtx != nil {
+			if !executed {
+				publishUnexecutedPick(ctx, auth, provider, routeModel, "context canceled before execution")
+			}
 			return nil, errCtx
 		}
 		entry := logEntryWithRequestID(ctx)
@@ -264,6 +271,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		executionSeq := m.nextExecutionSeq()
 		startStream := time.Now()
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+		executed = true
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 		if hasUpstreamExecutionAttempt(errStream) {
 			upstreamErr = errStream
