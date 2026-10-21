@@ -97,6 +97,34 @@ func (h *captureLogHook) Fire(entry *log.Entry) error {
 	return nil
 }
 
+func TestManagerExecuteStream_AntigravityCreditsSkipsUnsupportedModels(t *testing.T) {
+	// A model with "claude" in its name that Antigravity does NOT support (like claude-fable-5-1).
+	const unsupportedModel = "claude-fable-5-1"
+	const supportedModel = "claude-opus-4-6-thinking"
+
+	executor := &antigravityCreditsFallbackExecutor{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
+	})
+	manager.RegisterExecutor(executor)
+	// Register the auth supporting only supportedModel, NOT unsupportedModel.
+	registry.GetGlobalRegistry().RegisterClient("ag-credits-unsupported", "antigravity", []*registry.ModelInfo{{ID: supportedModel}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-credits-unsupported") })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "ag-credits-unsupported", Provider: "antigravity"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	// Should not find any candidates because ag-credits-unsupported does not support claude-fable-5-1.
+	candidates, errCandidates := manager.findAllAntigravityCreditsCandidateAuths(context.Background(), unsupportedModel, cliproxyexecutor.Options{})
+	if errCandidates != nil {
+		t.Fatalf("findAllAntigravityCreditsCandidateAuths error: %v", errCandidates)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("candidates = %d, want 0 for unsupported model %q", len(candidates), unsupportedModel)
+	}
+}
+
 func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *testing.T) {
 	const model = "claude-opus-4-6-thinking"
 	executor := &antigravityCreditsFallbackExecutor{}
