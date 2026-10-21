@@ -1297,7 +1297,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
 			continue
 		}
-		if !m.authSupportsRouteModel(registryRef, auth, routeModel) {
+		if registryRef != nil && len(registryRef.GetModelsForClient(auth.ID)) > 0 && !m.authSupportsRouteModel(registryRef, auth, routeModel) {
 			continue
 		}
 		providerKey := executorKeyFromAuth(auth)
