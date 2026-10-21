@@ -1,0 +1,76 @@
+From 71cc016eb3d200ab710b5d575943780a401a9283 Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Wed, 21 Oct 2026 20:03:43 +0700
+Subject: [PATCH] fix(sdk): match oauth model alias upstream names carrying
+ thinking suffix
+
+---
+ sdk/cliproxy/service_models.go                |  8 ++++++
+ .../service_oauth_model_alias_test.go         | 27 +++++++++++++++++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/sdk/cliproxy/service_models.go b/sdk/cliproxy/service_models.go
+index 16cbbf20..56d65803 100644
+--- a/sdk/cliproxy/service_models.go
++++ b/sdk/cliproxy/service_models.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+ 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+ )
+@@ -1249,7 +1250,14 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
+ 		if strings.EqualFold(name, alias) {
+ 			continue
+ 		}
++		// The upstream name may carry a thinking suffix (e.g. "devin/swe-2(high)");
++		// the registered catalog only contains the base model ID, so match on it.
+ 		key := strings.ToLower(name)
++		if parsed := thinking.ParseSuffix(name); parsed.HasSuffix {
++			if base := strings.ToLower(strings.TrimSpace(parsed.ModelName)); base != "" {
++				key = base
++			}
++		}
+ 		forward[key] = append(forward[key], aliasEntry{
+ 			alias:       alias,
+ 			displayName: strings.TrimSpace(aliases[i].DisplayName),
+diff --git a/sdk/cliproxy/service_oauth_model_alias_test.go b/sdk/cliproxy/service_oauth_model_alias_test.go
+index c7fb5551..e0b821e6 100644
+--- a/sdk/cliproxy/service_oauth_model_alias_test.go
++++ b/sdk/cliproxy/service_oauth_model_alias_test.go
+@@ -298,3 +298,30 @@ func TestApplyModelPrefixes_PreservesMetadataModelID(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestApplyOAuthModelAlias_UpstreamNameWithThinkingSuffix(t *testing.T) {
++	cfg := &config.Config{
++		OAuthModelAlias: map[string][]config.OAuthModelAlias{
++			"devin": {
++				{Name: "devin/swe-2(high)", Alias: "claude-opus-5", Fork: true},
++			},
++		},
++	}
++	models := []*ModelInfo{
++		{ID: "devin/swe-2", Name: "devin/swe-2", DisplayName: "SWE 2"},
++	}
++
++	out := applyOAuthModelAlias(cfg, "devin", "oauth", models)
++	if len(out) != 2 {
++		t.Fatalf("expected 2 models (base + forked alias), got %d", len(out))
++	}
++	if out[0].ID != "devin/swe-2" {
++		t.Fatalf("expected first model id %q, got %q", "devin/swe-2", out[0].ID)
++	}
++	if out[1].ID != "claude-opus-5" {
++		t.Fatalf("expected alias model id %q, got %q", "claude-opus-5", out[1].ID)
++	}
++	if out[1].MetadataModelID != "devin/swe-2" {
++		t.Fatalf("alias MetadataModelID = %q, want devin/swe-2", out[1].MetadataModelID)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

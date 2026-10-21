@@ -1,0 +1,102 @@
+From 911d9d32a6915050464f3c6ad2f11ca620985f1a Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Thu, 15 Oct 2026 06:31:41 +0700
+Subject: [PATCH] feat(api): add POST /v1/search endpoint dispatching to plugin
+ executors
+
+[LOCAL PATCH] Fork-local change, not upstream. Re-apply via
+patches/0001-v1-search-endpoint.patch if lost during upstream merge.
+
+Thin shim only: authenticates via the existing /v1 middleware, forwards
+{"query","max_results"} payloads to plugin executors in raw-search mode,
+and relays the plugin JSON. All search logic lives in the plugin.
+---
+ internal/api/server_routes.go     |  1 +
+ internal/api/server_web_search.go | 63 +++++++++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+ create mode 100644 internal/api/server_web_search.go
+
+diff --git a/internal/api/server_routes.go b/internal/api/server_routes.go
+index 61786b4a..a19b1459 100644
+--- a/internal/api/server_routes.go
++++ b/internal/api/server_routes.go
+@@ -81,6 +81,7 @@ func (s *Server) setupRoutes() {
+ 		v1.POST("/audio/speech", openaiHandlers.AudioSpeech)
+ 		v1.POST("/tts", openaiHandlers.XAITTS)
+ 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
++		v1.POST("/search", s.webSearchHandler)
+ 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
+ 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
+ 		v1.POST("/responses", openaiResponsesHandlers.Responses)
+diff --git a/internal/api/server_web_search.go b/internal/api/server_web_search.go
+new file mode 100644
+index 00000000..861c04b3
+--- /dev/null
++++ b/internal/api/server_web_search.go
+@@ -0,0 +1,63 @@
++package api
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++
++	"github.com/gin-gonic/gin"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
++)
++
++const webSearchAPIModel = "web-search"
++
++// webSearchHandler serves POST /v1/search: a raw web search API backed by the
++// web-search plugin executors. The request body is forwarded to the plugin
++// executor as-is ({"query": "...", "max_results": N}) and the plugin returns
++// plain JSON results.
++func (s *Server) webSearchHandler(c *gin.Context) {
++	raw, errRead := io.ReadAll(c.Request.Body)
++	if errRead != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "read request body: " + errRead.Error(), "type": "invalid_request_error"}})
++		return
++	}
++	var apiReq struct {
++		Query string `json:"query"`
++	}
++	if errUnmarshal := json.Unmarshal(raw, &apiReq); errUnmarshal != nil || strings.TrimSpace(apiReq.Query) == "" {
++		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "query is required", "type": "invalid_request_error"}})
++		return
++	}
++	host := s.pluginHost
++	if host == nil {
++		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "plugin host is unavailable", "type": "api_error"}})
++		return
++	}
++	routeResp, handled := host.RouteModel(c.Request.Context(), pluginapi.ModelRouteRequest{
++		SourceFormat:   "claude",
++		RequestedModel: webSearchAPIModel,
++		Stream:         false,
++		Body:           raw,
++	})
++	if !handled || !routeResp.Handled || routeResp.TargetKind != pluginapi.ModelRouteTargetSelf {
++		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "no web search backend available", "type": "api_error"}})
++		return
++	}
++	resp, errExec := host.ExecutePluginExecutor(c.Request.Context(), routeResp.Target, coreexecutor.Request{
++		Model:   webSearchAPIModel,
++		Payload: raw,
++	}, coreexecutor.Options{
++		Stream:          false,
++		OriginalRequest: raw,
++		SourceFormat:    sdktranslator.FormatClaude,
++		ResponseFormat:  sdktranslator.FormatClaude,
++	})
++	if errExec != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": errExec.Error(), "type": "api_error"}})
++		return
++	}
++	c.Data(http.StatusOK, "application/json", resp.Payload)
++}
+-- 
+2.50.1 (Apple Git-155)
+

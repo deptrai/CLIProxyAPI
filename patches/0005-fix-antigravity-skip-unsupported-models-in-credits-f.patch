@@ -1,0 +1,75 @@
+From 8f62ad17255b670af4e2c8f6577919f8def704b8 Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Wed, 21 Oct 2026 10:20:40 +0700
+Subject: [PATCH] fix(antigravity): skip unsupported models in credits fallback
+ candidates
+
+---
+ sdk/cliproxy/auth/antigravity_credits_test.go | 28 +++++++++++++++++++
+ sdk/cliproxy/auth/conductor_home.go           |  4 +++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/sdk/cliproxy/auth/antigravity_credits_test.go b/sdk/cliproxy/auth/antigravity_credits_test.go
+index 94a9448f..14319b69 100644
+--- a/sdk/cliproxy/auth/antigravity_credits_test.go
++++ b/sdk/cliproxy/auth/antigravity_credits_test.go
+@@ -97,6 +97,34 @@ func (h *captureLogHook) Fire(entry *log.Entry) error {
+ 	return nil
+ }
+ 
++func TestManagerExecuteStream_AntigravityCreditsSkipsUnsupportedModels(t *testing.T) {
++	// A model with "claude" in its name that Antigravity does NOT support (like claude-fable-5-1).
++	const unsupportedModel = "claude-fable-5-1"
++	const supportedModel = "claude-opus-4-6-thinking"
++
++	executor := &antigravityCreditsFallbackExecutor{}
++	manager := NewManager(nil, nil, nil)
++	manager.SetConfig(&internalconfig.Config{
++		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
++	})
++	manager.RegisterExecutor(executor)
++	// Register the auth supporting only supportedModel, NOT unsupportedModel.
++	registry.GetGlobalRegistry().RegisterClient("ag-credits-unsupported", "antigravity", []*registry.ModelInfo{{ID: supportedModel}})
++	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-credits-unsupported") })
++	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "ag-credits-unsupported", Provider: "antigravity"}); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	// Should not find any candidates because ag-credits-unsupported does not support claude-fable-5-1.
++	candidates, errCandidates := manager.findAllAntigravityCreditsCandidateAuths(context.Background(), unsupportedModel, cliproxyexecutor.Options{})
++	if errCandidates != nil {
++		t.Fatalf("findAllAntigravityCreditsCandidateAuths error: %v", errCandidates)
++	}
++	if len(candidates) != 0 {
++		t.Fatalf("candidates = %d, want 0 for unsupported model %q", len(candidates), unsupportedModel)
++	}
++}
++
+ func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *testing.T) {
+ 	const model = "claude-opus-4-6-thinking"
+ 	executor := &antigravityCreditsFallbackExecutor{}
+diff --git a/sdk/cliproxy/auth/conductor_home.go b/sdk/cliproxy/auth/conductor_home.go
+index 1810c78d..29f67558 100644
+--- a/sdk/cliproxy/auth/conductor_home.go
++++ b/sdk/cliproxy/auth/conductor_home.go
+@@ -1282,6 +1282,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
+ 	}
+ 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+ 	var candidates []creditsCandidateEntry
++	registryRef := registry.GetGlobalRegistry()
+ 	m.mu.RLock()
+ 	for _, auth := range m.auths {
+ 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+@@ -1296,6 +1297,9 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
+ 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
+ 			continue
+ 		}
++		if !m.authSupportsRouteModel(registryRef, auth, routeModel) {
++			continue
++		}
+ 		providerKey := executorKeyFromAuth(auth)
+ 		executor, ok := m.executorLocked(providerKey)
+ 		if !ok {
+-- 
+2.50.1 (Apple Git-155)
+

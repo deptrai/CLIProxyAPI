@@ -1,0 +1,26 @@
+From f9e3145d0dc8f0b76a8d3d787eb0a1539be4026a Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Wed, 21 Oct 2026 20:00:51 +0700
+Subject: [PATCH] fix(antigravity): guard credits candidates against
+ unregistered mock clients
+
+---
+ sdk/cliproxy/auth/conductor_home.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sdk/cliproxy/auth/conductor_home.go b/sdk/cliproxy/auth/conductor_home.go
+index 29f67558..b0127223 100644
+--- a/sdk/cliproxy/auth/conductor_home.go
++++ b/sdk/cliproxy/auth/conductor_home.go
+@@ -1297,7 +1297,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
+ 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
+ 			continue
+ 		}
+-		if !m.authSupportsRouteModel(registryRef, auth, routeModel) {
++		if registryRef != nil && len(registryRef.GetModelsForClient(auth.ID)) > 0 && !m.authSupportsRouteModel(registryRef, auth, routeModel) {
+ 			continue
+ 		}
+ 		providerKey := executorKeyFromAuth(auth)
+-- 
+2.50.1 (Apple Git-155)
+

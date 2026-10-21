@@ -1,0 +1,29 @@
+From a2d6a37697a291a00b8d69af2e2990e3fe0508fa Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Thu, 8 Oct 2026 02:46:47 +0700
+Subject: [PATCH] fix(docker): derive healthcheck port from mounted config.yaml
+
+The healthcheck hardcoded 127.0.0.1:8317, but deployments can run on a
+different port (e.g. staging on 8318) via config.yaml. Hardcoding made
+the task fail health checks and swarm rolled the update back. Read the
+port from the bind-mounted config.yaml, falling back to 8317.
+---
+ Dockerfile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index c62cfb56..0c20c430 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -35,7 +35,7 @@ COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+ WORKDIR /CLIProxyAPI
+ 
+ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+-  CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8317 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q " 200"'
++  CMD bash -c 'PORT=$(grep -oE "^[[:space:]]*port:[[:space:]]*[0-9]+" /CLIProxyAPI/config.yaml | grep -oE "[0-9]+" | head -1); PORT=${PORT:-8317}; exec 3<>/dev/tcp/127.0.0.1/$PORT && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q " 200"'
+ 
+ EXPOSE 8317
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,286 @@
+From 78f50764a512e66b6eb78676314c5a5033596cda Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Wed, 21 Oct 2026 08:48:51 +0700
+Subject: [PATCH] fix(executor/devin): filter leaked tool tags and halt
+ degenerate tag repetition loops
+
+- Add DevinContentFilter to strip internal tool closing tags (</invoke>, </parameter>, DSML tags) from streaming content deltas.
+- Detect degenerate repetition loops of consecutive tag-only chunks (>= 4) and gracefully halt stream with sawEOS to protect client sessions from hanging and runaway token consumption.
+- Add unit tests covering filter mechanics, repetition thresholds, and stream termination.
+---
+ internal/runtime/executor/devin_executor.go   | 27 ++++--
+ .../executor/devin_stream_content_test.go     | 33 +++++++
+ .../executor/helps/devin_stream_filter.go     | 70 ++++++++++++++
+ .../helps/devin_stream_filter_test.go         | 93 +++++++++++++++++++
+ 4 files changed, 214 insertions(+), 9 deletions(-)
+ create mode 100644 internal/runtime/executor/helps/devin_stream_filter.go
+ create mode 100644 internal/runtime/executor/helps/devin_stream_filter_test.go
+
+diff --git a/internal/runtime/executor/devin_executor.go b/internal/runtime/executor/devin_executor.go
+index 1b8ec84d..0e031f04 100644
+--- a/internal/runtime/executor/devin_executor.go
++++ b/internal/runtime/executor/devin_executor.go
+@@ -533,6 +533,7 @@ func (e *DevinExecutor) streamDevinFramesForAuth(
+ 	toolCallCount := 0
+ 	thinkingBuf := &helps.UTF8SplitBuffer{}
+ 	contentBuf := &helps.UTF8SplitBuffer{}
++	contentFilter := &helps.DevinContentFilter{}
+ 	var accumulatedThinking strings.Builder
+ 	var accumulatedContent strings.Builder
+ 	var finalUsage *helps.DevinUsage
+@@ -1028,19 +1029,27 @@ func (e *DevinExecutor) streamDevinFramesForAuth(
+ 
+ 		// Emit content text delta
+ 		if frameRes.ContentText != "" {
+-			accumulatedContent.WriteString(frameRes.ContentText)
+ 			chunk := contentBuf.Feed([]byte(frameRes.ContentText))
+ 			if chunk != "" {
+-				if thoughtStarted && (!streamContentEarly || len(pendingActions) > 0) {
+-					capturedChunk := chunk
+-					pendingActions = append(pendingActions, func() bool {
+-						return emitContentChunk(capturedChunk)
+-					})
+-				} else {
+-					if !emitContentChunk(chunk) {
+-						return
++				cleanChunk, shouldHalt := contentFilter.FilterChunk(chunk)
++				if cleanChunk != "" {
++					accumulatedContent.WriteString(cleanChunk)
++					if thoughtStarted && (!streamContentEarly || len(pendingActions) > 0) {
++						capturedChunk := cleanChunk
++						pendingActions = append(pendingActions, func() bool {
++							return emitContentChunk(capturedChunk)
++						})
++					} else {
++						if !emitContentChunk(cleanChunk) {
++							return
++						}
+ 					}
+ 				}
++				if shouldHalt {
++					log.Warnf("devin executor: detected degenerate tool tag repetition loop, halting stream gracefully")
++					sawEOS = true
++					break
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/internal/runtime/executor/devin_stream_content_test.go b/internal/runtime/executor/devin_stream_content_test.go
+index 0e8c674b..b410e3e4 100644
+--- a/internal/runtime/executor/devin_stream_content_test.go
++++ b/internal/runtime/executor/devin_stream_content_test.go
+@@ -324,3 +324,36 @@ func TestDevinStreamContentDoesNotOvertakeQueuedTool(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestDevinStreamDegenerateToolTagLoopTerminates(t *testing.T) {
++	var frames bytes.Buffer
++	// Frame 1: valid initial text
++	frames.Write(devinContentTestFrame(3, "Initial answer: "))
++	// Next 10 frames: degenerate repetition of </invoke>\n</parameter>\n
++	for i := 0; i < 10; i++ {
++		frames.Write(devinContentTestFrame(3, "\n</invoke>\n</parameter>\n"))
++	}
++
++	out := make(chan cliproxyexecutor.StreamChunk, 64)
++	e := &DevinExecutor{}
++	e.streamDevinFrames(context.Background(), &frames, cliproxyexecutor.Request{Model: "devin/deepseek-v4-1-flash"}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI}, "deepseek-v4-1-flash-max", sdktranslator.FormatOpenAI, nil, out)
++
++	events, errs := devinContentTestEvents(out)
++	if len(errs) > 0 {
++		t.Fatalf("unexpected stream errors: %v", errs)
++	}
++
++	var content strings.Builder
++	for _, event := range events {
++		delta := event.Get("choices.0.delta.content").String()
++		content.WriteString(delta)
++	}
++
++	got := content.String()
++	if !strings.Contains(got, "Initial answer: ") {
++		t.Errorf("expected content to contain initial text, got %q", got)
++	}
++	if strings.Contains(got, "</invoke>") || strings.Contains(got, "</parameter>") {
++		t.Errorf("expected leaked tags to be stripped, got %q", got)
++	}
++}
+diff --git a/internal/runtime/executor/helps/devin_stream_filter.go b/internal/runtime/executor/helps/devin_stream_filter.go
+new file mode 100644
+index 00000000..94b98248
+--- /dev/null
++++ b/internal/runtime/executor/helps/devin_stream_filter.go
+@@ -0,0 +1,70 @@
++package helps
++
++import (
++	"strings"
++)
++
++// DevinContentFilter filters leaked raw tool markup and suppresses degenerate
++// token repetition loops (such as infinite repeating </invoke> and </parameter> tags)
++// emitted by upstream reasoning models during long-context tool invocation.
++type DevinContentFilter struct {
++	consecutiveTagOnlyCount int
++	halted                  bool
++}
++
++var leakedToolTags = []string{
++	"</invoke>",
++	"</parameter>",
++	"<invoke/>",
++	"<parameter/>",
++	"</tool_call>",
++	"</tool_calls>",
++	"<tool_call/>",
++	"<tool_calls/>",
++	"<｜DSML｜tool_calls>",
++	"</｜DSML｜>",
++	"<｜tool call end｜>",
++	"<｜tool calls end｜>",
++}
++
++// FilterChunk inspects a streaming text chunk from upstream Devin response.
++// It removes leaked internal tool tags. If consecutive chunks consist purely of
++// leaked tags and whitespace (a degenerate repetition loop), it flags shouldHalt = true
++// to terminate the stream before consuming excessive tokens or hanging client sessions.
++func (f *DevinContentFilter) FilterChunk(chunk string) (clean string, shouldHalt bool) {
++	if f.halted {
++		return "", true
++	}
++	if chunk == "" {
++		return "", false
++	}
++
++	hasTag := false
++	cleaned := chunk
++	for _, tag := range leakedToolTags {
++		if strings.Contains(cleaned, tag) {
++			hasTag = true
++			cleaned = strings.ReplaceAll(cleaned, tag, "")
++		}
++	}
++
++	trimmed := strings.TrimSpace(cleaned)
++
++	if hasTag && trimmed == "" {
++		// Chunk contained only leaked tool tags and whitespace.
++		f.consecutiveTagOnlyCount++
++		if f.consecutiveTagOnlyCount >= 4 {
++			f.halted = true
++			return "", true
++		}
++		// Suppress emitting empty whitespace from leaked tags.
++		return "", false
++	}
++
++	if trimmed != "" {
++		// Meaningful content received, reset consecutive tag counter.
++		f.consecutiveTagOnlyCount = 0
++	}
++
++	return cleaned, false
++}
+diff --git a/internal/runtime/executor/helps/devin_stream_filter_test.go b/internal/runtime/executor/helps/devin_stream_filter_test.go
+new file mode 100644
+index 00000000..eadb23a8
+--- /dev/null
++++ b/internal/runtime/executor/helps/devin_stream_filter_test.go
+@@ -0,0 +1,93 @@
++package helps
++
++import (
++	"testing"
++)
++
++func TestDevinContentFilter(t *testing.T) {
++	t.Run("normal text passes through untouched", func(t *testing.T) {
++		f := &DevinContentFilter{}
++		chunks := []string{"Hello, ", "how can I ", "help you today?"}
++		for _, c := range chunks {
++			clean, halt := f.FilterChunk(c)
++			if halt {
++				t.Fatalf("expected halt=false, got true for chunk %q", c)
++			}
++			if clean != c {
++				t.Fatalf("expected clean=%q, got %q", c, clean)
++			}
++		}
++	})
++
++	t.Run("leaked tool closing tag is stripped from text", func(t *testing.T) {
++		f := &DevinContentFilter{}
++		input := "Result is ready.</invoke>"
++		clean, halt := f.FilterChunk(input)
++		if halt {
++			t.Fatal("expected halt=false")
++		}
++		if clean != "Result is ready." {
++			t.Fatalf("expected 'Result is ready.', got %q", clean)
++		}
++	})
++
++	t.Run("degenerate repetition loop of closing tags triggers halt", func(t *testing.T) {
++		f := &DevinContentFilter{}
++		loopChunk := "\n</invoke>\n</parameter>\n"
++
++		for i := 1; i <= 3; i++ {
++			clean, halt := f.FilterChunk(loopChunk)
++			if halt {
++				t.Fatalf("iteration %d: expected halt=false before threshold", i)
++			}
++			if clean != "" {
++				t.Fatalf("iteration %d: expected clean='', got %q", i, clean)
++			}
++		}
++
++		// 4th iteration should trigger halt
++		clean, halt := f.FilterChunk(loopChunk)
++		if !halt {
++			t.Fatal("iteration 4: expected halt=true")
++		}
++		if clean != "" {
++			t.Fatalf("expected clean='', got %q", clean)
++		}
++
++		// 5th iteration stays halted
++		clean, halt = f.FilterChunk("any subsequent text")
++		if !halt {
++			t.Fatal("iteration 5: expected halt=true when already halted")
++		}
++		if clean != "" {
++			t.Fatalf("expected clean='', got %q", clean)
++		}
++	})
++
++	t.Run("resets tag counter when meaningful text appears", func(t *testing.T) {
++		f := &DevinContentFilter{}
++		loopChunk := "</invoke>"
++
++		// 2 tag chunks
++		if _, halt := f.FilterChunk(loopChunk); halt {
++			t.Fatal("expected halt=false")
++		}
++		if _, halt := f.FilterChunk(loopChunk); halt {
++			t.Fatal("expected halt=false")
++		}
++
++		// Meaningful text resets counter
++		clean, halt := f.FilterChunk("Wait, here is the answer: ")
++		if halt || clean != "Wait, here is the answer: " {
++			t.Fatalf("expected clean='Wait, here is the answer:', got %q (halt=%v)", clean, halt)
++		}
++
++		// 2 more tag chunks should NOT halt yet (counter reset to 0)
++		if _, halt = f.FilterChunk(loopChunk); halt {
++			t.Fatal("expected halt=false after reset")
++		}
++		if _, halt = f.FilterChunk(loopChunk); halt {
++			t.Fatal("expected halt=false after reset")
++		}
++	})
++}
+-- 
+2.50.1 (Apple Git-155)
+

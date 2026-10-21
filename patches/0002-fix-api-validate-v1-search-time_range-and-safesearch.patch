@@ -1,0 +1,46 @@
+From 818359d9f8fb3eff66aca08406f7e1f53e034839 Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Thu, 15 Oct 2026 08:17:35 +0700
+Subject: [PATCH] fix(api): validate /v1/search time_range and safesearch with
+ HTTP 400
+
+[LOCAL PATCH] Extends the /v1/search shim: reject invalid time_range
+(day|week|month|year) and safesearch (0-2) values with 400 instead of
+letting them surface as plugin executor 502s.
+---
+ internal/api/server_web_search.go | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/internal/api/server_web_search.go b/internal/api/server_web_search.go
+index 861c04b3..eb6affda 100644
+--- a/internal/api/server_web_search.go
++++ b/internal/api/server_web_search.go
+@@ -25,12 +25,24 @@ func (s *Server) webSearchHandler(c *gin.Context) {
+ 		return
+ 	}
+ 	var apiReq struct {
+-		Query string `json:"query"`
++		Query      string `json:"query"`
++		TimeRange  string `json:"time_range"`
++		SafeSearch *int   `json:"safesearch"`
+ 	}
+ 	if errUnmarshal := json.Unmarshal(raw, &apiReq); errUnmarshal != nil || strings.TrimSpace(apiReq.Query) == "" {
+ 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "query is required", "type": "invalid_request_error"}})
+ 		return
+ 	}
++	switch apiReq.TimeRange {
++	case "", "day", "week", "month", "year":
++	default:
++		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "time_range must be one of day|week|month|year", "type": "invalid_request_error"}})
++		return
++	}
++	if apiReq.SafeSearch != nil && (*apiReq.SafeSearch < 0 || *apiReq.SafeSearch > 2) {
++		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "safesearch must be 0, 1 or 2", "type": "invalid_request_error"}})
++		return
++	}
+ 	host := s.pluginHost
+ 	if host == nil {
+ 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "plugin host is unavailable", "type": "api_error"}})
+-- 
+2.50.1 (Apple Git-155)
+
