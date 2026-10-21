@@ -108,6 +108,32 @@ func TestNoLimitedCandidatesDelegates(t *testing.T) {
 	}
 }
 
+func TestPickCountTokensDelegatesWithoutAcquiringSlot(t *testing.T) {
+	seedConfig(t, nil)
+	defer func() { inflight.slots = map[string][]time.Time{} }()
+
+	// count_tokens requests complete without usage records; acquiring a slot
+	// here would hold the credential until slot_ttl.
+	raw, err := handleMethod("scheduler.pick", []byte(`{"provider":"devin","options":{"metadata":{"request_path":"/v1/messages/count_tokens"}},"candidates":[{"ID":"eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}]}`))
+	if err != nil {
+		t.Fatalf("pickAuth error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	var resp pluginapiPickResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if resp.Handled {
+		t.Fatalf("count_tokens pick should delegate to builtin, got %+v", resp)
+	}
+	if len(inflight.slots["eps"]) != 0 {
+		t.Fatalf("count_tokens pick acquired a slot: %v", inflight.slots["eps"])
+	}
+}
+
 func TestHigherPriorityWinsEvenIfListedLast(t *testing.T) {
 	seedConfig(t, nil)
 	defer func() { inflight.slots = map[string][]time.Time{} }()

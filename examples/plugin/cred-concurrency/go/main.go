@@ -324,6 +324,13 @@ func pickAuth(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
+	// Token-count routes never emit usage records, so any slot acquired for
+	// them would be held until slot_ttl and brick the credential. Defer to the
+	// builtin scheduler (still priority-ordered) without consuming a slot.
+	if path, ok := req.Options.Metadata["request_path"].(string); ok &&
+		strings.HasSuffix(path, "/count_tokens") {
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
 	cfg := loadedConfig()
 
 	// Fast path: no limited candidate at all -> let the builtin scheduler run.
