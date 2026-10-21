@@ -1,0 +1,136 @@
+From e0e286c10e45af0b518756d4d5059aba14f18e63 Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Wed, 21 Oct 2026 23:10:44 +0700
+Subject: [PATCH] fix(plugin): cred-concurrency release live stamps before
+ swept credits
+
+A usage record arriving while swept[authID] > 0 was consumed by the
+swept counter instead of popping a live stamp. Once a single slot was
+reclaimed as a leak, every later usage record got eaten the same way,
+so a limit-1 credential served one request per slot_ttl window and
+looked permanently busy (fable fell to glmfb/deepseek for ~30m at a
+time on prod). Live stamps now release on their own records first;
+swept credits only retire records that arrive with nothing live.
+---
+ examples/plugin/cred-concurrency/go/main.go   | 33 ++++++++-------
+ .../plugin/cred-concurrency/go/main_test.go   | 40 ++++++++++++++++---
+ 2 files changed, 54 insertions(+), 19 deletions(-)
+
+diff --git a/examples/plugin/cred-concurrency/go/main.go b/examples/plugin/cred-concurrency/go/main.go
+index e0b3ad1a..1a658d3e 100644
+--- a/examples/plugin/cred-concurrency/go/main.go
++++ b/examples/plugin/cred-concurrency/go/main.go
+@@ -59,10 +59,11 @@ var inflight = struct {
+ 	sync.Mutex
+ 	slots      map[string][]time.Time
+ 	lastPicked map[string]string
+-	// swept counts slots per auth ID that sweepStale reclaimed as leaks. A later
+-	// usage record for that auth ID is assumed to belong to a swept (leaked) slot
+-	// first, so releaseSlot never pops a live stamp for it. This biases toward
+-	// under-admitting (a live slot may be held until TTL) but never over-admits.
++	// swept counts slots per auth ID that sweepStale reclaimed as leaks. A usage
++	// record arriving while no live stamps exist is assumed to belong to a swept
++	// slot and retires one credit. Live stamps always release on their own
++	// records first: a leaked slot's record usually never arrives at all, so
++	// letting swept outrank live stamps bricks the credential until restart.
+ 	swept map[string]int
+ }{
+ 	slots:      make(map[string][]time.Time),
+@@ -432,21 +433,25 @@ func releaseSlot(raw []byte) ([]byte, error) {
+ 	}
+ 	inflight.Lock()
+ 	defer inflight.Unlock()
+-	// If some slots for this auth were swept as leaks, assume this usage record
+-	// belongs to one of those leaked slots and leave the live stamps untouched.
+-	// Otherwise pop the oldest live stamp (FIFO) as before.
++	stamps := inflight.slots[authID]
++	if len(stamps) > 0 {
++		// Live stamps release first: a record almost always belongs to a live
++		// pick. A swept slot's record rarely arrives later (requests do not
++		// outlive the TTL by much), and eating live records while swept credit
++		// exists strands every future stamp behind the TTL.
++		if len(stamps) == 1 {
++			delete(inflight.slots, authID)
++		} else {
++			inflight.slots[authID] = stamps[1:]
++		}
++		return okEnvelope(struct{}{})
++	}
++	// No live stamps: the record belongs to a slot already reclaimed as a leak.
+ 	if inflight.swept[authID] > 0 {
+ 		inflight.swept[authID]--
+ 		if inflight.swept[authID] <= 0 {
+ 			delete(inflight.swept, authID)
+ 		}
+-		return okEnvelope(struct{}{})
+-	}
+-	stamps := inflight.slots[authID]
+-	if len(stamps) <= 1 {
+-		delete(inflight.slots, authID)
+-	} else {
+-		inflight.slots[authID] = stamps[1:]
+ 	}
+ 	return okEnvelope(struct{}{})
+ }
+diff --git a/examples/plugin/cred-concurrency/go/main_test.go b/examples/plugin/cred-concurrency/go/main_test.go
+index 44801274..20b788a1 100644
+--- a/examples/plugin/cred-concurrency/go/main_test.go
++++ b/examples/plugin/cred-concurrency/go/main_test.go
+@@ -299,7 +299,7 @@ func TestSweepStaleReclaimsExpiredSlots(t *testing.T) {
+ 	}
+ }
+ 
+-func TestReleaseSlotConsumesSweptBeforeLiveStamp(t *testing.T) {
++func TestReleaseSlotPopsLiveStampBeforeSwept(t *testing.T) {
+ 	resetInflight(t)
+ 	now := time.Now()
+ 	inflight.Lock()
+@@ -311,11 +311,41 @@ func TestReleaseSlotConsumesSweptBeforeLiveStamp(t *testing.T) {
+ 
+ 	inflight.Lock()
+ 	defer inflight.Unlock()
+-	if got := inflight.slots["x"]; len(got) != 1 {
+-		t.Fatalf("slots[x] = %v, want the live stamp untouched", got)
++	if got := inflight.slots["x"]; len(got) != 0 {
++		t.Fatalf("slots[x] = %v, want the live stamp released", got)
++	}
++	if inflight.swept["x"] != 1 {
++		t.Fatalf("swept[x] = %d, want credit kept for the still-missing record", inflight.swept["x"])
++	}
++}
++
++func TestSweptRatchetDoesNotBrickCredential(t *testing.T) {
++	seedConfig(t, nil)
++	resetInflight(t)
++	cands := `[{"ID":"x","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}]`
++
++	// A picked slot whose usage record never arrives leaks; a pick after the TTL
++	// sweeps it and acquires a fresh live stamp in the same call.
++	inflight.Lock()
++	inflight.slots["x"] = []time.Time{time.Now().Add(-time.Hour)}
++	inflight.Unlock()
++	if r := pick(t, cands); r.AuthID != "x" {
++		t.Fatalf("pick after sweep = %+v, want x", r)
++	}
++	if got := inflight.swept["x"]; got != 1 {
++		t.Fatalf("swept[x] = %d, want 1", got)
++	}
++	// The live request's usage record must release its own stamp even though a
++	// swept credit lingers; otherwise the cred bricks until restart.
++	usage(t, "x")
++	inflight.Lock()
++	got := len(inflight.slots["x"])
++	inflight.Unlock()
++	if got != 0 {
++		t.Fatalf("slots[x] len = %d, want live stamp released (no ratchet)", got)
+ 	}
+-	if _, ok := inflight.swept["x"]; ok {
+-		t.Fatalf("swept[x] = %d, want key deleted", inflight.swept["x"])
++	if r := pick(t, cands); r.AuthID != "x" {
++		t.Fatalf("post-release pick = %+v, want x", r)
+ 	}
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
