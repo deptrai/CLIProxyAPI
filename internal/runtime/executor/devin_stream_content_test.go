@@ -324,3 +324,36 @@ func TestDevinStreamContentDoesNotOvertakeQueuedTool(t *testing.T) {
 		})
 	}
 }
+
+func TestDevinStreamDegenerateToolTagLoopTerminates(t *testing.T) {
+	var frames bytes.Buffer
+	// Frame 1: valid initial text
+	frames.Write(devinContentTestFrame(3, "Initial answer: "))
+	// Next 10 frames: degenerate repetition of </invoke>\n</parameter>\n
+	for i := 0; i < 10; i++ {
+		frames.Write(devinContentTestFrame(3, "\n</invoke>\n</parameter>\n"))
+	}
+
+	out := make(chan cliproxyexecutor.StreamChunk, 64)
+	e := &DevinExecutor{}
+	e.streamDevinFrames(context.Background(), &frames, cliproxyexecutor.Request{Model: "devin/deepseek-v4-1-flash"}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI}, "deepseek-v4-1-flash-max", sdktranslator.FormatOpenAI, nil, out)
+
+	events, errs := devinContentTestEvents(out)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected stream errors: %v", errs)
+	}
+
+	var content strings.Builder
+	for _, event := range events {
+		delta := event.Get("choices.0.delta.content").String()
+		content.WriteString(delta)
+	}
+
+	got := content.String()
+	if !strings.Contains(got, "Initial answer: ") {
+		t.Errorf("expected content to contain initial text, got %q", got)
+	}
+	if strings.Contains(got, "</invoke>") || strings.Contains(got, "</parameter>") {
+		t.Errorf("expected leaked tags to be stripped, got %q", got)
+	}
+}

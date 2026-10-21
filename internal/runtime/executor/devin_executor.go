@@ -533,6 +533,7 @@ func (e *DevinExecutor) streamDevinFramesForAuth(
 	toolCallCount := 0
 	thinkingBuf := &helps.UTF8SplitBuffer{}
 	contentBuf := &helps.UTF8SplitBuffer{}
+	contentFilter := &helps.DevinContentFilter{}
 	var accumulatedThinking strings.Builder
 	var accumulatedContent strings.Builder
 	var finalUsage *helps.DevinUsage
@@ -1028,18 +1029,26 @@ func (e *DevinExecutor) streamDevinFramesForAuth(
 
 		// Emit content text delta
 		if frameRes.ContentText != "" {
-			accumulatedContent.WriteString(frameRes.ContentText)
 			chunk := contentBuf.Feed([]byte(frameRes.ContentText))
 			if chunk != "" {
-				if thoughtStarted && (!streamContentEarly || len(pendingActions) > 0) {
-					capturedChunk := chunk
-					pendingActions = append(pendingActions, func() bool {
-						return emitContentChunk(capturedChunk)
-					})
-				} else {
-					if !emitContentChunk(chunk) {
-						return
+				cleanChunk, shouldHalt := contentFilter.FilterChunk(chunk)
+				if cleanChunk != "" {
+					accumulatedContent.WriteString(cleanChunk)
+					if thoughtStarted && (!streamContentEarly || len(pendingActions) > 0) {
+						capturedChunk := cleanChunk
+						pendingActions = append(pendingActions, func() bool {
+							return emitContentChunk(capturedChunk)
+						})
+					} else {
+						if !emitContentChunk(cleanChunk) {
+							return
+						}
 					}
+				}
+				if shouldHalt {
+					log.Warnf("devin executor: detected degenerate tool tag repetition loop, halting stream gracefully")
+					sawEOS = true
+					break
 				}
 			}
 		}
