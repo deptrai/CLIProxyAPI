@@ -1282,6 +1282,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	var candidates []creditsCandidateEntry
+	registryRef := registry.GetGlobalRegistry()
 	m.mu.RLock()
 	for _, auth := range m.auths {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
@@ -1294,6 +1295,9 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
+			continue
+		}
+		if !m.authSupportsRouteModel(registryRef, auth, routeModel) {
 			continue
 		}
 		providerKey := executorKeyFromAuth(auth)
