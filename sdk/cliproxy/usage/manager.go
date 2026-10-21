@@ -539,7 +539,9 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		m.mu.Unlock()
 		return
 	}
-	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
+	// Detach cancellation: queued usage records must reach plugins even when the
+	// originating request context is already canceled (client disconnect, 499).
+	m.queue = append(m.queue, queueItem{ctx: context.WithoutCancel(ctx), record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
 }
