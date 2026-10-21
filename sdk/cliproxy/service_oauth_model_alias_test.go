@@ -298,3 +298,30 @@ func TestApplyModelPrefixes_PreservesMetadataModelID(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyOAuthModelAlias_UpstreamNameWithThinkingSuffix(t *testing.T) {
+	cfg := &config.Config{
+		OAuthModelAlias: map[string][]config.OAuthModelAlias{
+			"devin": {
+				{Name: "devin/swe-2(high)", Alias: "claude-opus-5", Fork: true},
+			},
+		},
+	}
+	models := []*ModelInfo{
+		{ID: "devin/swe-2", Name: "devin/swe-2", DisplayName: "SWE 2"},
+	}
+
+	out := applyOAuthModelAlias(cfg, "devin", "oauth", models)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 models (base + forked alias), got %d", len(out))
+	}
+	if out[0].ID != "devin/swe-2" {
+		t.Fatalf("expected first model id %q, got %q", "devin/swe-2", out[0].ID)
+	}
+	if out[1].ID != "claude-opus-5" {
+		t.Fatalf("expected alias model id %q, got %q", "claude-opus-5", out[1].ID)
+	}
+	if out[1].MetadataModelID != "devin/swe-2" {
+		t.Fatalf("alias MetadataModelID = %q, want devin/swe-2", out[1].MetadataModelID)
+	}
+}

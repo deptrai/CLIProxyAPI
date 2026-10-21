@@ -10,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
@@ -1249,7 +1250,14 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 		if strings.EqualFold(name, alias) {
 			continue
 		}
+		// The upstream name may carry a thinking suffix (e.g. "devin/swe-2(high)");
+		// the registered catalog only contains the base model ID, so match on it.
 		key := strings.ToLower(name)
+		if parsed := thinking.ParseSuffix(name); parsed.HasSuffix {
+			if base := strings.ToLower(strings.TrimSpace(parsed.ModelName)); base != "" {
+				key = base
+			}
+		}
 		forward[key] = append(forward[key], aliasEntry{
 			alias:       alias,
 			displayName: strings.TrimSpace(aliases[i].DisplayName),
