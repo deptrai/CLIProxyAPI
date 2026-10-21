@@ -1,0 +1,36 @@
+From 3d38cb5b40fbc92261b8b677eb711ea5a63995bf Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Wed, 21 Oct 2026 18:07:22 +0700
+Subject: [PATCH] fix(usage): deliver records to plugins despite canceled
+ request ctx
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Queued usage records carried the originating request context, so a client
+disconnect (HTTP 499) poisoned every downstream plugin call — usage.handle
+never reached cred-concurrency and its scheduler slot leaked until TTL.
+Detach cancellation at enqueue, mirroring the WithoutCancel treatment that
+request.complete already uses.
+---
+ sdk/cliproxy/usage/manager.go | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/sdk/cliproxy/usage/manager.go b/sdk/cliproxy/usage/manager.go
+index 2e46ee6a..92ad423b 100644
+--- a/sdk/cliproxy/usage/manager.go
++++ b/sdk/cliproxy/usage/manager.go
+@@ -539,7 +539,9 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
+ 		m.mu.Unlock()
+ 		return
+ 	}
+-	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
++	// Detach cancellation: queued usage records must reach plugins even when the
++	// originating request context is already canceled (client disconnect, 499).
++	m.queue = append(m.queue, queueItem{ctx: context.WithoutCancel(ctx), record: record})
+ 	m.mu.Unlock()
+ 	m.cond.Signal()
+ }
+-- 
+2.50.1 (Apple Git-155)
+
