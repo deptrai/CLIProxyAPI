@@ -59,10 +59,11 @@ var inflight = struct {
 	sync.Mutex
 	slots      map[string][]time.Time
 	lastPicked map[string]string
-	// swept counts slots per auth ID that sweepStale reclaimed as leaks. A later
-	// usage record for that auth ID is assumed to belong to a swept (leaked) slot
-	// first, so releaseSlot never pops a live stamp for it. This biases toward
-	// under-admitting (a live slot may be held until TTL) but never over-admits.
+	// swept counts slots per auth ID that sweepStale reclaimed as leaks. A usage
+	// record arriving while no live stamps exist is assumed to belong to a swept
+	// slot and retires one credit. Live stamps always release on their own
+	// records first: a leaked slot's record usually never arrives at all, so
+	// letting swept outrank live stamps bricks the credential until restart.
 	swept map[string]int
 }{
 	slots:      make(map[string][]time.Time),
@@ -432,21 +433,25 @@ func releaseSlot(raw []byte) ([]byte, error) {
 	}
 	inflight.Lock()
 	defer inflight.Unlock()
-	// If some slots for this auth were swept as leaks, assume this usage record
-	// belongs to one of those leaked slots and leave the live stamps untouched.
-	// Otherwise pop the oldest live stamp (FIFO) as before.
+	stamps := inflight.slots[authID]
+	if len(stamps) > 0 {
+		// Live stamps release first: a record almost always belongs to a live
+		// pick. A swept slot's record rarely arrives later (requests do not
+		// outlive the TTL by much), and eating live records while swept credit
+		// exists strands every future stamp behind the TTL.
+		if len(stamps) == 1 {
+			delete(inflight.slots, authID)
+		} else {
+			inflight.slots[authID] = stamps[1:]
+		}
+		return okEnvelope(struct{}{})
+	}
+	// No live stamps: the record belongs to a slot already reclaimed as a leak.
 	if inflight.swept[authID] > 0 {
 		inflight.swept[authID]--
 		if inflight.swept[authID] <= 0 {
 			delete(inflight.swept, authID)
 		}
-		return okEnvelope(struct{}{})
-	}
-	stamps := inflight.slots[authID]
-	if len(stamps) <= 1 {
-		delete(inflight.slots, authID)
-	} else {
-		inflight.slots[authID] = stamps[1:]
 	}
 	return okEnvelope(struct{}{})
 }

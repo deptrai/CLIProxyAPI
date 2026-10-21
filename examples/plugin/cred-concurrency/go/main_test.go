@@ -299,7 +299,7 @@ func TestSweepStaleReclaimsExpiredSlots(t *testing.T) {
 	}
 }
 
-func TestReleaseSlotConsumesSweptBeforeLiveStamp(t *testing.T) {
+func TestReleaseSlotPopsLiveStampBeforeSwept(t *testing.T) {
 	resetInflight(t)
 	now := time.Now()
 	inflight.Lock()
@@ -311,11 +311,41 @@ func TestReleaseSlotConsumesSweptBeforeLiveStamp(t *testing.T) {
 
 	inflight.Lock()
 	defer inflight.Unlock()
-	if got := inflight.slots["x"]; len(got) != 1 {
-		t.Fatalf("slots[x] = %v, want the live stamp untouched", got)
+	if got := inflight.slots["x"]; len(got) != 0 {
+		t.Fatalf("slots[x] = %v, want the live stamp released", got)
 	}
-	if _, ok := inflight.swept["x"]; ok {
-		t.Fatalf("swept[x] = %d, want key deleted", inflight.swept["x"])
+	if inflight.swept["x"] != 1 {
+		t.Fatalf("swept[x] = %d, want credit kept for the still-missing record", inflight.swept["x"])
+	}
+}
+
+func TestSweptRatchetDoesNotBrickCredential(t *testing.T) {
+	seedConfig(t, nil)
+	resetInflight(t)
+	cands := `[{"ID":"x","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}]`
+
+	// A picked slot whose usage record never arrives leaks; a pick after the TTL
+	// sweeps it and acquires a fresh live stamp in the same call.
+	inflight.Lock()
+	inflight.slots["x"] = []time.Time{time.Now().Add(-time.Hour)}
+	inflight.Unlock()
+	if r := pick(t, cands); r.AuthID != "x" {
+		t.Fatalf("pick after sweep = %+v, want x", r)
+	}
+	if got := inflight.swept["x"]; got != 1 {
+		t.Fatalf("swept[x] = %d, want 1", got)
+	}
+	// The live request's usage record must release its own stamp even though a
+	// swept credit lingers; otherwise the cred bricks until restart.
+	usage(t, "x")
+	inflight.Lock()
+	got := len(inflight.slots["x"])
+	inflight.Unlock()
+	if got != 0 {
+		t.Fatalf("slots[x] len = %d, want live stamp released (no ratchet)", got)
+	}
+	if r := pick(t, cands); r.AuthID != "x" {
+		t.Fatalf("post-release pick = %+v, want x", r)
 	}
 }
 
