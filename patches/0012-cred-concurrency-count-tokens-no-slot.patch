@@ -1,0 +1,73 @@
+From f10cde1ad9247731c573c5f86349f05b6774b417 Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Wed, 21 Oct 2026 23:38:20 +0700
+Subject: [PATCH] fix(plugin): cred-concurrency skip slot acquire for
+ count_tokens
+
+Token-count routes complete without emitting usage records, so any slot
+acquired for them was held until slot_ttl and bricked the credential.
+Delegate /count_tokens picks to the builtin scheduler instead; priority
+order is preserved and no slot is consumed.
+---
+ examples/plugin/cred-concurrency/go/main.go   |  7 +++++
+ .../plugin/cred-concurrency/go/main_test.go   | 26 +++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/examples/plugin/cred-concurrency/go/main.go b/examples/plugin/cred-concurrency/go/main.go
+index 1a658d3e..0686a1e1 100644
+--- a/examples/plugin/cred-concurrency/go/main.go
++++ b/examples/plugin/cred-concurrency/go/main.go
+@@ -324,6 +324,13 @@ func pickAuth(raw []byte) ([]byte, error) {
+ 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+ 		return nil, errUnmarshal
+ 	}
++	// Token-count routes never emit usage records, so any slot acquired for
++	// them would be held until slot_ttl and brick the credential. Defer to the
++	// builtin scheduler (still priority-ordered) without consuming a slot.
++	if path, ok := req.Options.Metadata["request_path"].(string); ok &&
++		strings.HasSuffix(path, "/count_tokens") {
++		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
++	}
+ 	cfg := loadedConfig()
+ 
+ 	// Fast path: no limited candidate at all -> let the builtin scheduler run.
+diff --git a/examples/plugin/cred-concurrency/go/main_test.go b/examples/plugin/cred-concurrency/go/main_test.go
+index 20b788a1..3ba37964 100644
+--- a/examples/plugin/cred-concurrency/go/main_test.go
++++ b/examples/plugin/cred-concurrency/go/main_test.go
+@@ -108,6 +108,32 @@ func TestNoLimitedCandidatesDelegates(t *testing.T) {
+ 	}
+ }
+ 
++func TestPickCountTokensDelegatesWithoutAcquiringSlot(t *testing.T) {
++	seedConfig(t, nil)
++	defer func() { inflight.slots = map[string][]time.Time{} }()
++
++	// count_tokens requests complete without usage records; acquiring a slot
++	// here would hold the credential until slot_ttl.
++	raw, err := handleMethod("scheduler.pick", []byte(`{"provider":"devin","options":{"metadata":{"request_path":"/v1/messages/count_tokens"}},"candidates":[{"ID":"eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}]}`))
++	if err != nil {
++		t.Fatalf("pickAuth error: %v", err)
++	}
++	var env envelope
++	if err := json.Unmarshal(raw, &env); err != nil {
++		t.Fatalf("envelope: %v", err)
++	}
++	var resp pluginapiPickResponse
++	if err := json.Unmarshal(env.Result, &resp); err != nil {
++		t.Fatalf("result: %v", err)
++	}
++	if resp.Handled {
++		t.Fatalf("count_tokens pick should delegate to builtin, got %+v", resp)
++	}
++	if len(inflight.slots["eps"]) != 0 {
++		t.Fatalf("count_tokens pick acquired a slot: %v", inflight.slots["eps"])
++	}
++}
++
+ func TestHigherPriorityWinsEvenIfListedLast(t *testing.T) {
+ 	seedConfig(t, nil)
+ 	defer func() { inflight.slots = map[string][]time.Time{} }()
+-- 
+2.50.1 (Apple Git-155)
+
