@@ -278,10 +278,10 @@ func (e *DevinExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		errData, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
 		helps.AppendAPIResponseChunk(ctx, e.cfg, errData)
-		return resp, newDevinStatusError(httpResp.StatusCode, httpResp.Header, errData)
+		return resp, newDevinStatusErrorForAuth(httpResp.StatusCode, httpResp.Header, errData, auth)
 	}
 
-	interactionsJSON, respLog, errConsume := consumeDevinFramesToInteractions(httpResp.Body, req.Model, chatModelUID, helps.ApplyPatchOriginalRequest(req, opts))
+	interactionsJSON, respLog, errConsume := consumeDevinFramesToInteractionsForAuth(httpResp.Body, req.Model, chatModelUID, auth, helps.ApplyPatchOriginalRequest(req, opts))
 	if respLog != nil || len(interactionsJSON) > 0 {
 		logRespBody := helps.BuildDevinUpstreamResponseLogBody(respLog, interactionsJSON)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, logRespBody)
@@ -357,7 +357,7 @@ func (e *DevinExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		errData, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
 		_ = httpResp.Body.Close()
 		helps.AppendAPIResponseChunk(ctx, e.cfg, errData)
-		return nil, newDevinStatusError(httpResp.StatusCode, httpResp.Header, errData)
+		return nil, newDevinStatusErrorForAuth(httpResp.StatusCode, httpResp.Header, errData, auth)
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -379,7 +379,7 @@ func (e *DevinExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 
-		e.streamDevinFrames(streamCtx, httpResp.Body, req, opts, chatModelUID, responseFormat, reporter, out)
+		e.streamDevinFramesForAuth(streamCtx, httpResp.Body, req, opts, chatModelUID, responseFormat, reporter, out, auth)
 	}()
 
 	return &cliproxyexecutor.StreamResult{
@@ -497,6 +497,22 @@ func (e *DevinExecutor) streamDevinFrames(
 	reporter *helps.UsageReporter,
 	out chan<- cliproxyexecutor.StreamChunk,
 ) {
+	e.streamDevinFramesForAuth(ctx, body, req, opts, chatModelUID, responseFormat, reporter, out, nil)
+}
+
+// streamDevinFramesForAuth streams Devin frames for auth; auth may be nil in tests,
+// in which case quota errors carry credential scope without a reset-based delay.
+func (e *DevinExecutor) streamDevinFramesForAuth(
+	ctx context.Context,
+	body io.Reader,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	chatModelUID string,
+	responseFormat sdktranslator.Format,
+	reporter *helps.UsageReporter,
+	out chan<- cliproxyexecutor.StreamChunk,
+	auth *cliproxyauth.Auth,
+) {
 	if reporter != nil {
 		if chatModelUID != "" {
 			reporter.SetUpstreamModel(chatModelUID)
@@ -518,6 +534,7 @@ func (e *DevinExecutor) streamDevinFrames(
 	toolCallCount := 0
 	thinkingBuf := &helps.UTF8SplitBuffer{}
 	contentBuf := &helps.UTF8SplitBuffer{}
+	contentFilter := &helps.DevinContentFilter{}
 	var accumulatedThinking strings.Builder
 	var accumulatedContent strings.Builder
 	var finalUsage *helps.DevinUsage
@@ -853,7 +870,7 @@ func (e *DevinExecutor) streamDevinFrames(
 				failedEvent, _ := sjson.SetBytes([]byte(`{"event_type":"response.failed","error":{"message":"","code":""}}`), "error.message", errTrailer.Error())
 				failedEvent, _ = sjson.SetBytes(failedEvent, "error.code", fmt.Sprintf("%d", code))
 				_ = emitInteractionsEvent(failedEvent)
-				emitStreamError(newDevinTrailerStatusError(code, errTrailer))
+				emitStreamError(devinTrailerStatusError(code, errTrailer.Error(), auth))
 				return
 			}
 			sawEOS = true
@@ -1013,18 +1030,26 @@ func (e *DevinExecutor) streamDevinFrames(
 
 		// Emit content text delta
 		if frameRes.ContentText != "" {
-			accumulatedContent.WriteString(frameRes.ContentText)
 			chunk := contentBuf.Feed([]byte(frameRes.ContentText))
 			if chunk != "" {
-				if thoughtStarted && (!streamContentEarly || len(pendingActions) > 0) {
-					capturedChunk := chunk
-					pendingActions = append(pendingActions, func() bool {
-						return emitContentChunk(capturedChunk)
-					})
-				} else {
-					if !emitContentChunk(chunk) {
-						return
+				cleanChunk, shouldHalt := contentFilter.FilterChunk(chunk)
+				if cleanChunk != "" {
+					accumulatedContent.WriteString(cleanChunk)
+					if thoughtStarted && (!streamContentEarly || len(pendingActions) > 0) {
+						capturedChunk := cleanChunk
+						pendingActions = append(pendingActions, func() bool {
+							return emitContentChunk(capturedChunk)
+						})
+					} else {
+						if !emitContentChunk(cleanChunk) {
+							return
+						}
 					}
+				}
+				if shouldHalt {
+					log.Warnf("devin executor: detected degenerate tool tag repetition loop, halting stream gracefully")
+					sawEOS = true
+					break
 				}
 			}
 		}
@@ -1150,6 +1175,10 @@ func (e *DevinExecutor) streamDevinFrames(
 }
 
 func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string, original ...[]byte) ([]byte, *helps.DevinUpstreamResponseLog, error) {
+	return consumeDevinFramesToInteractionsForAuth(body, model, chatModelUID, nil, original...)
+}
+
+func consumeDevinFramesToInteractionsForAuth(body io.Reader, model, chatModelUID string, auth *cliproxyauth.Auth, original ...[]byte) ([]byte, *helps.DevinUpstreamResponseLog, error) {
 	interactionID := fmt.Sprintf("interaction_%s", uuid.New().String()[:12])
 	var preToolTextParts []string
 	var postToolTextParts []string
@@ -1243,7 +1272,7 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
 					Usage:         finalUsage,
 					UnknownFields: unknownFields,
 				}
-				return nil, respLog, newDevinTrailerStatusError(code, errTrailer)
+				return nil, respLog, devinTrailerStatusError(code, errTrailer.Error(), auth)
 			}
 			sawEOS = true
 			break
@@ -2361,12 +2390,32 @@ func parseSignatureBytes(sigStr string) ([]byte, string) {
 		return []byte(s), "openai"
 	case internalsignature.SignatureProviderGemini:
 		return []byte(s), "gemini"
+	case internalsignature.SignatureProviderMeta:
+		// Positively foreign to the Devin backend: never supplement it as a
+		// sealed signature.
+		return nil, ""
 	}
 	if strings.HasPrefix(s, "AY") {
 		return []byte(s), "gemini"
 	}
 	if decoded, err := base64.StdEncoding.DecodeString(s); err == nil && len(decoded) > 0 {
 		decStr := string(decoded)
+		if strings.HasPrefix(decStr, "cpa-codex-gemini-carrier-v1:") {
+			inner := strings.TrimSpace(strings.TrimPrefix(decStr, "cpa-codex-gemini-carrier-v1:"))
+			if strings.HasPrefix(inner, "sealed.v1.") {
+				return []byte(inner), "sealed"
+			}
+			switch internalsignature.DetectSignatureProvider(inner) {
+			case internalsignature.SignatureProviderClaude:
+				return []byte(inner), "anthropic"
+			case internalsignature.SignatureProviderGPT:
+				return []byte(inner), "openai"
+			case internalsignature.SignatureProviderGemini:
+				return []byte(inner), "gemini"
+			default:
+				return nil, ""
+			}
+		}
 		if strings.HasPrefix(decStr, "sealed.v1.") {
 			return decoded, "sealed"
 		}
@@ -2377,6 +2426,8 @@ func parseSignatureBytes(sigStr string) ([]byte, string) {
 			return decoded, "openai"
 		case internalsignature.SignatureProviderGemini:
 			return []byte(s), "gemini"
+		case internalsignature.SignatureProviderMeta:
+			return nil, ""
 		}
 		if strings.HasPrefix(decStr, "CAQS") || strings.HasPrefix(decStr, "CAIS") {
 			return decoded, "anthropic"
@@ -2412,6 +2463,8 @@ func detectSignatureType(sig string) string {
 		return "openai"
 	case internalsignature.SignatureProviderGemini:
 		return "gemini"
+	case internalsignature.SignatureProviderMeta:
+		return ""
 	}
 	if strings.HasPrefix(s, "CAQS") || strings.HasPrefix(s, "CAIS") {
 		return "anthropic"
@@ -2558,15 +2611,50 @@ func devinResetHintFromMessage(msg string, now time.Time) *time.Duration {
 	return nil
 }
 
-// devinMessageIsCredentialScoped reports whether a Devin error message
-// describes an account-level quota exhaustion rather than a per-model rate
-// limit. Account-scoped failures cool down the whole credential.
-func devinMessageIsCredentialScoped(msg string) bool {
-	lower := strings.ToLower(msg)
-	return strings.Contains(lower, "usage quota")
+// devinTrailerStatusError builds the scheduling view of a Connect trailer
+// error. Explicit account-wide daily/weekly usage quota exhaustion (issue
+// #6690) is credential-scoped and, when auth carries a valid observed reset
+// timestamp for that window, retries only after the reset. Transient
+// capacity and generic rate-limit 429s stay model-scoped.
+func devinTrailerStatusError(code int, msg string, auth *cliproxyauth.Auth) statusErr {
+	err := statusErr{code: code, msg: msg}
+	if code == http.StatusTooManyRequests {
+		err.retryAfter = devinResetHintFromMessage(err.msg, time.Now())
+	}
+	return devinQuotaScopedStatusError(err, auth, time.Now())
+}
+
+// devinQuotaScopedStatusError upgrades a 429 to credential scope when its
+// message reports daily/weekly usage quota exhaustion, deriving RetryAfter
+// from the matching observed reset signal. An explicit Retry-After already
+// carried by err is preserved and never overwritten by signal data.
+func devinQuotaScopedStatusError(err statusErr, auth *cliproxyauth.Auth, now time.Time) statusErr {
+	if err.code != http.StatusTooManyRequests {
+		return err
+	}
+	period := helps.DevinUsageQuotaExhaustionPeriod(err.msg)
+	if period == helps.DevinQuotaPeriodNone {
+		return err
+	}
+	err.credentialScoped = true
+	if err.retryAfter == nil && auth != nil {
+		key := "daily_quota_reset_at"
+		if period == helps.DevinQuotaPeriodWeekly {
+			key = "weekly_quota_reset_at"
+		}
+		err.retryAfter = helps.DevinQuotaRetryAfter(auth.Quota.Signals[key], now)
+	}
+	return err
 }
 
 func newDevinStatusError(code int, headers http.Header, body []byte) statusErr {
+	return newDevinStatusErrorForAuth(code, headers, body, nil)
+}
+
+// newDevinStatusErrorForAuth builds the scheduling view of a direct HTTP
+// (non-trailer) upstream failure. Daily/weekly quota exhaustion becomes
+// credential-scoped and, when auth is known, retries at the observed reset.
+func newDevinStatusErrorForAuth(code int, headers http.Header, body []byte, auth *cliproxyauth.Auth) statusErr {
 	err := statusErr{code: code, msg: string(body)}
 	if code == http.StatusTooManyRequests {
 		if headers != nil {
@@ -2585,24 +2673,21 @@ func newDevinStatusError(code int, headers http.Header, body []byte) statusErr {
 		if err.retryAfter == nil {
 			err.retryAfter = devinResetHintFromMessage(err.msg, time.Now())
 		}
-		err.credentialScoped = devinMessageIsCredentialScoped(err.msg)
 	}
-	return err
+	// An explicit Retry-After header parsed above keeps precedence inside
+	// devinQuotaScopedStatusError; signal data only fills the gap.
+	return devinQuotaScopedStatusError(err, auth, time.Now())
 }
 
 // newDevinTrailerStatusError builds a statusErr for Devin stream trailer
 // failures, which carry no HTTP headers. The trailer message still embeds the
 // same reset hints, so parse them for an accurate cooldown.
 func newDevinTrailerStatusError(code int, trailerErr error) statusErr {
-	err := statusErr{code: code}
+	msg := ""
 	if trailerErr != nil {
-		err.msg = trailerErr.Error()
+		msg = trailerErr.Error()
 	}
-	if code == http.StatusTooManyRequests {
-		err.retryAfter = devinResetHintFromMessage(err.msg, time.Now())
-		err.credentialScoped = devinMessageIsCredentialScoped(err.msg)
-	}
-	return err
+	return devinTrailerStatusError(code, msg, nil)
 }
 
 func devinAuthCredentials(auth *cliproxyauth.Auth) (apiKey string, baseURL string, deviceSeed string) {

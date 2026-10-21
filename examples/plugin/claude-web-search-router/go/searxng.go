@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -15,6 +16,9 @@ type searxngClient struct {
 	urls []string
 	idx  atomic.Uint64
 	http *http.Client
+	// lastServed stores the base URL that served the most recent successful
+	// search, for backend_detail reporting in the raw search API.
+	lastServed atomic.Value
 }
 
 func newSearXNGClient(urls []string) *searxngClient {
@@ -49,6 +53,10 @@ type searxngSearchResponse struct {
 }
 
 func (c *searxngClient) search(ctx context.Context, query string, maxResults int) ([]claudeWebSearchHit, string, error) {
+	return c.searchOpts(ctx, query, maxResults, searchOptions{})
+}
+
+func (c *searxngClient) searchOpts(ctx context.Context, query string, maxResults int, opts searchOptions) ([]claudeWebSearchHit, string, error) {
 	if !c.available() {
 		return nil, "", fmt.Errorf("searxng_urls is empty")
 	}
@@ -63,8 +71,9 @@ func (c *searxngClient) search(ctx context.Context, query string, maxResults int
 	var lastErr error
 	for offset := 0; offset < len(c.urls); offset++ {
 		base := c.urls[(start+offset)%len(c.urls)]
-		hits, answer, err := c.searchOne(ctx, base, query, maxResults)
+		hits, answer, err := c.searchOne(ctx, base, query, maxResults, opts)
 		if err == nil {
+			c.lastServed.Store(base)
 			return hits, answer, nil
 		}
 		lastErr = err
@@ -72,8 +81,41 @@ func (c *searxngClient) search(ctx context.Context, query string, maxResults int
 	return nil, "", lastErr
 }
 
-func (c *searxngClient) searchOne(ctx context.Context, baseURL, query string, maxResults int) ([]claudeWebSearchHit, string, error) {
-	endpoint := baseURL + "/search?" + url.Values{"q": {query}, "format": {"json"}}.Encode()
+// lastBackendHost returns the host (no credentials) of the SearXNG instance
+// that served the last successful search, or "" if none.
+func (c *searxngClient) lastBackendHost() string {
+	if c == nil {
+		return ""
+	}
+	base, ok := c.lastServed.Load().(string)
+	if !ok || base == "" {
+		return ""
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
+func (c *searxngClient) searchOne(ctx context.Context, baseURL, query string, maxResults int, opts searchOptions) ([]claudeWebSearchHit, string, error) {
+	v := url.Values{"q": {query}, "format": {"json"}}
+	if opts.Language != "" && opts.Language != "auto" {
+		v.Set("language", opts.Language)
+	}
+	if opts.TimeRange != "" {
+		v.Set("time_range", opts.TimeRange)
+	}
+	if opts.SafeSearch != nil {
+		v.Set("safesearch", strconv.Itoa(*opts.SafeSearch))
+	}
+	if opts.Engines != "" {
+		v.Set("engines", opts.Engines)
+	}
+	if opts.Categories != "" {
+		v.Set("categories", opts.Categories)
+	}
+	endpoint := baseURL + "/search?" + v.Encode()
 	req, errNew := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if errNew != nil {
 		return nil, "", errNew
