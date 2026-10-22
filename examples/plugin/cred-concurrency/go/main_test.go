@@ -413,3 +413,193 @@ func TestConfigureRejectsNonPositiveSlotTTL(t *testing.T) {
 	// Restore a valid config so other tests are unaffected.
 	t.Cleanup(func() { currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute}) })
 }
+
+// seedAffinityConfig enables session affinity (and optionally round-robin).
+func seedAffinityConfig(t *testing.T, rrProviders map[string]bool) {
+	t.Helper()
+	currentConfig.Store(pluginConfig{
+		slotTTL:         30 * time.Minute,
+		rrProviders:     rrProviders,
+		affinityTTL:     time.Hour,
+		SessionAffinity: true,
+	})
+	t.Cleanup(func() { currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute}) })
+}
+
+// pickWithSession issues a scheduler.pick carrying a session identity header.
+func pickWithSession(t *testing.T, candidates, header, sessionID string) pluginapiPickResponse {
+	t.Helper()
+	body := map[string]any{
+		"provider":   "devin",
+		"model":      "claude-fable-5-1",
+		"candidates": json.RawMessage(candidates),
+		"options": map[string]any{
+			"headers": map[string][]string{header: {sessionID}},
+		},
+	}
+	rawReq, errMarshal := json.Marshal(body)
+	if errMarshal != nil {
+		t.Fatalf("marshal: %v", errMarshal)
+	}
+	raw, err := handleMethod("scheduler.pick", rawReq)
+	if err != nil {
+		t.Fatalf("pickAuth error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	if !env.OK {
+		t.Fatalf("pick not ok: %s", raw)
+	}
+	var resp pluginapiPickResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	return resp
+}
+
+func TestSessionAffinityPinsCredentialAcrossTurns(t *testing.T) {
+	// Round-robin would alternate cle<->eps; affinity must keep one session on
+	// the credential holding its cached prefix.
+	seedAffinityConfig(t, map[string]bool{"devin": true})
+	resetInflight(t)
+	cands := `[
+		{"ID":"01-cle","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}},
+		{"ID":"02-eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}
+	]`
+
+	first := pickWithSession(t, cands, "X-Claude-Code-Session-Id", "session-a")
+	usage(t, first.AuthID)
+
+	for i := 0; i < 3; i++ {
+		got := pickWithSession(t, cands, "X-Claude-Code-Session-Id", "session-a")
+		if got.AuthID != first.AuthID {
+			t.Fatalf("turn %d picked %s, want pinned %s", i+2, got.AuthID, first.AuthID)
+		}
+		usage(t, got.AuthID)
+	}
+
+	// A different session is free to land on the other credential.
+	other := pickWithSession(t, cands, "X-Claude-Code-Session-Id", "session-b")
+	if other.AuthID == first.AuthID {
+		t.Fatalf("second session also pinned to %s; affinity over-applied", other.AuthID)
+	}
+}
+
+func TestSessionAffinitySubagentInheritsParent(t *testing.T) {
+	seedAffinityConfig(t, map[string]bool{"devin": true})
+	resetInflight(t)
+	cands := `[
+		{"ID":"01-cle","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}},
+		{"ID":"02-eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}
+	]`
+
+	parent := pickWithSession(t, cands, "X-Claude-Code-Session-Id", "root-task")
+	usage(t, parent.AuthID)
+
+	// Subagent carries its own session id but points at the parent.
+	sub := pickWithSession(t, cands, "X-Parent-Session-Id", "root-task")
+	if sub.AuthID != parent.AuthID {
+		t.Fatalf("subagent picked %s, want parent's %s", sub.AuthID, parent.AuthID)
+	}
+
+	// ":agent:" suffixed ids fold onto the parent too.
+	usage(t, sub.AuthID)
+	sub2 := pickWithSession(t, cands, "X-Claude-Code-Session-Id", "root-task:agent:worker-1")
+	if sub2.AuthID != parent.AuthID {
+		t.Fatalf("agent-suffixed session picked %s, want parent's %s", sub2.AuthID, parent.AuthID)
+	}
+}
+
+func TestSessionAffinityKeepsPinWhenBoundCredentialBusy(t *testing.T) {
+	seedAffinityConfig(t, nil)
+	resetInflight(t)
+	cands := `[
+		{"ID":"01-cle","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}},
+		{"ID":"02-eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}
+	]`
+
+	first := pickWithSession(t, cands, "X-Session-ID", "session-busy")
+	// Leave the slot held so the pinned credential is at its cap.
+	spill := pickWithSession(t, cands, "X-Session-ID", "session-busy")
+	if spill.AuthID == first.AuthID {
+		t.Fatalf("expected spill to a peer while %s is busy, got %s", first.AuthID, spill.AuthID)
+	}
+	// The pin must survive the transient spill: once the original frees up the
+	// session returns to it instead of drifting permanently.
+	usage(t, first.AuthID)
+	usage(t, spill.AuthID)
+	back := pickWithSession(t, cands, "X-Session-ID", "session-busy")
+	if back.AuthID != first.AuthID {
+		t.Fatalf("after release picked %s, want the original pin %s", back.AuthID, first.AuthID)
+	}
+}
+
+func TestSessionAffinityOffKeepsRoundRobin(t *testing.T) {
+	// Default config has affinity disabled: behaviour must match the old RR path.
+	seedConfig(t, map[string]bool{"devin": true})
+	resetInflight(t)
+	cands := `[
+		{"ID":"01-cle","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}},
+		{"ID":"02-eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}
+	]`
+
+	first := pickWithSession(t, cands, "X-Claude-Code-Session-Id", "session-rr")
+	usage(t, first.AuthID)
+	second := pickWithSession(t, cands, "X-Claude-Code-Session-Id", "session-rr")
+	if second.AuthID == first.AuthID {
+		t.Fatalf("affinity disabled but picks stayed on %s; RR broken", first.AuthID)
+	}
+}
+
+func TestSweepBindingsDropsExpiredPins(t *testing.T) {
+	resetInflight(t)
+	now := time.Now()
+	inflight.Lock()
+	inflight.bindings["k"] = affinityBinding{authID: "x", at: now.Add(-2 * time.Hour)}
+	inflight.bindings["fresh"] = affinityBinding{authID: "y", at: now}
+	inflight.Unlock()
+
+	sweepBindings(now, time.Hour)
+
+	inflight.Lock()
+	defer inflight.Unlock()
+	if _, ok := inflight.bindings["k"]; ok {
+		t.Fatalf("expired binding survived the sweep")
+	}
+	if _, ok := inflight.bindings["fresh"]; !ok {
+		t.Fatalf("live binding was dropped")
+	}
+}
+
+func TestSessionAffinityDoesNotBindFallbackTier(t *testing.T) {
+	// A session that starts while the preferred tier is exhausted must not be
+	// pinned to the paid fallback; it should return to the top tier once free.
+	seedAffinityConfig(t, nil)
+	resetInflight(t)
+	cands := `[
+		{"ID":"01-cle","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}},
+		{"ID":"glm","Provider":"devin","Priority":14,"Metadata":{"max-concurrent":4}}
+	]`
+
+	// Hold the top tier busy with another session.
+	blocker := pickWithSession(t, cands, "X-Session-ID", "blocker")
+	if blocker.AuthID != "01-cle" {
+		t.Fatalf("blocker = %s, want 01-cle", blocker.AuthID)
+	}
+
+	// Our session starts during the outage and lands on the fallback.
+	first := pickWithSession(t, cands, "X-Session-ID", "late-session")
+	if first.AuthID != "glm" {
+		t.Fatalf("late session = %s, want fallback glm", first.AuthID)
+	}
+	usage(t, first.AuthID)
+
+	// Preferred tier frees up: the session must go back, not stay on the pin.
+	usage(t, blocker.AuthID)
+	next := pickWithSession(t, cands, "X-Session-ID", "late-session")
+	if next.AuthID != "01-cle" {
+		t.Fatalf("after recovery picked %s, want top tier 01-cle", next.AuthID)
+	}
+}

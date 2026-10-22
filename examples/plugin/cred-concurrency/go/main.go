@@ -65,10 +65,21 @@ var inflight = struct {
 	// records first: a leaked slot's record usually never arrives at all, so
 	// letting swept outrank live stamps bricks the credential until restart.
 	swept map[string]int
+	// bindings pins a session (per provider+model) to one credential. Upstream
+	// prefix caches live on the serving account, so spreading one conversation
+	// across accounts throws the cached prefix away on every hop.
+	bindings map[string]affinityBinding
 }{
 	slots:      make(map[string][]time.Time),
 	lastPicked: make(map[string]string),
 	swept:      make(map[string]int),
+	bindings:   make(map[string]affinityBinding),
+}
+
+// affinityBinding is one session-to-credential pin with the time it was made.
+type affinityBinding struct {
+	authID string
+	at     time.Time
 }
 
 type envelope struct {
@@ -99,9 +110,18 @@ type pluginConfig struct {
 	// listed keep fill-first ordering: the first credential under its cap is
 	// reused, which preserves upstream prefix caching on a single account.
 	RoundRobinProviders []string `yaml:"round_robin_providers"`
+	// SessionAffinity pins a session to the credential that served it first so
+	// upstream prefix caches stay warm across turns. Subagents inherit their
+	// parent session's binding via X-Parent-Session-Id. Off by default because
+	// the host only reaches this plugin when the builtin selector is bypassed.
+	SessionAffinity bool `yaml:"session_affinity"`
+	// SessionAffinityTTL bounds how long a binding survives without a fresh
+	// pick. Defaults to 1h.
+	SessionAffinityTTL string `yaml:"session_affinity_ttl"`
 
 	slotTTL     time.Duration
 	rrProviders map[string]bool
+	affinityTTL time.Duration
 }
 
 type registration struct {
@@ -206,6 +226,17 @@ func configure(raw []byte) error {
 	if cfg.slotTTL <= 0 {
 		return errors.New("slot_ttl must be a positive duration")
 	}
+	cfg.affinityTTL = time.Hour
+	if trimmed := strings.TrimSpace(cfg.SessionAffinityTTL); trimmed != "" {
+		parsed, errParse := time.ParseDuration(trimmed)
+		if errParse != nil {
+			return errParse
+		}
+		cfg.affinityTTL = parsed
+	}
+	if cfg.affinityTTL <= 0 {
+		return errors.New("session_affinity_ttl must be a positive duration")
+	}
 	cfg.rrProviders = map[string]bool{}
 	for _, provider := range cfg.RoundRobinProviders {
 		if trimmed := strings.TrimSpace(provider); trimmed != "" {
@@ -247,6 +278,16 @@ func pluginRegistration() registration {
 					Name:        "round_robin_providers",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "Providers that rotate picks within a priority tier (e.g. [devin] to spread quota). Unlisted providers keep fill-first order so one credential stays hot for upstream caching.",
+				},
+				{
+					Name:        "session_affinity",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Pin each session (and its subagents, via X-Parent-Session-Id) to the credential that served it first so upstream prefix caches stay warm. Default false.",
+				},
+				{
+					Name:        "session_affinity_ttl",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "How long a session-to-credential pin survives without a fresh pick (default 1h).",
 				},
 			},
 		},
@@ -319,6 +360,97 @@ func sweepStale(now time.Time, ttl time.Duration) {
 	}
 }
 
+// affinitySessionHeaders mirrors the host's session extraction order so a
+// session keeps one identity whether the builtin selector or this plugin picks.
+var affinitySessionHeaders = []string{
+	"X-Claude-Code-Session-Id",
+	"Session-Id",
+	"X-Http-Session-Id",
+	"X-Session-ID",
+	"X-Session-Affinity",
+	"X-Slot-Session-Id",
+}
+
+func headerValue(headers map[string][]string, name string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+// stripSubagentSuffix folds "<parent>:agent:<id>" onto its parent so subagents
+// share the conversation's credential instead of pinning their own.
+func stripSubagentSuffix(sessionID string) string {
+	if idx := strings.Index(sessionID, ":agent:"); idx > 0 {
+		return sessionID[:idx]
+	}
+	return sessionID
+}
+
+// sessionIdentity resolves the affinity key for a request. A subagent's parent
+// session wins over its own ID, matching session-affinity-subagents in the host.
+func sessionIdentity(opts pluginapi.SchedulerOptions) string {
+	if opts.Metadata != nil {
+		if parent, ok := opts.Metadata["parent_session_id"].(string); ok {
+			if trimmed := strings.TrimSpace(parent); trimmed != "" {
+				return stripSubagentSuffix(trimmed)
+			}
+		}
+		if canonical, ok := opts.Metadata["canonical_session_id"].(string); ok {
+			if trimmed := strings.TrimSpace(canonical); trimmed != "" {
+				return stripSubagentSuffix(trimmed)
+			}
+		}
+	}
+	if parent := headerValue(opts.Headers, "X-Parent-Session-Id"); parent != "" {
+		return stripSubagentSuffix(parent)
+	}
+	for _, name := range affinitySessionHeaders {
+		if sessionID := headerValue(opts.Headers, name); sessionID != "" {
+			return stripSubagentSuffix(sessionID)
+		}
+	}
+	return ""
+}
+
+// sweepBindings drops pins that outlived the affinity TTL so a long-dead
+// session cannot keep a credential reserved forever.
+func sweepBindings(now time.Time, ttl time.Duration) {
+	for key, binding := range inflight.bindings {
+		if now.Sub(binding.at) >= ttl {
+			delete(inflight.bindings, key)
+		}
+	}
+}
+
+func acquireSlot(candidate pluginapi.SchedulerAuthCandidate, limit int64, rotKey string, now time.Time) bool {
+	if limit > 0 {
+		if int64(len(inflight.slots[candidate.ID])) >= limit {
+			return false
+		}
+		inflight.slots[candidate.ID] = append(inflight.slots[candidate.ID], now)
+	}
+	if inflight.lastPicked != nil && rotKey != "" {
+		inflight.lastPicked[rotKey] = candidate.ID
+	}
+	return true
+}
+
+func tierRotationKey(candidate pluginapi.SchedulerAuthCandidate) string {
+	rotKey := strconv.Itoa(candidate.Priority)
+	if provider := strings.TrimSpace(candidate.Provider); provider != "" {
+		rotKey = provider + ":" + rotKey
+	}
+	return rotKey
+}
+
 func pickAuth(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -350,6 +482,35 @@ func pickAuth(raw []byte) ([]byte, error) {
 	defer inflight.Unlock()
 	sweepStale(now, cfg.slotTTL)
 
+	// Session affinity runs before tier ordering: a conversation must stay on
+	// the account holding its cached prefix even when a peer tier exists.
+	bindKey := ""
+	pinnedBusy := false
+	if cfg.SessionAffinity {
+		sweepBindings(now, cfg.affinityTTL)
+		if sessionID := sessionIdentity(req.Options); sessionID != "" {
+			providerKey := strings.ToLower(strings.TrimSpace(req.Provider))
+			if providerKey == "" {
+				providerKey = "mixed"
+			}
+			bindKey = providerKey + "::" + sessionID + "::" + strings.ToLower(strings.TrimSpace(req.Model))
+			if binding, ok := inflight.bindings[bindKey]; ok {
+				for _, candidate := range req.Candidates {
+					if candidate.ID != binding.authID {
+						continue
+					}
+					// Busy is transient: fail over for this request but keep the
+					// pin so the session returns once the slot frees.
+					if acquireSlot(candidate, limitFor(cfg, candidate), tierRotationKey(candidate), now) {
+						return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+					}
+					pinnedBusy = true
+					break
+				}
+			}
+		}
+	}
+
 	// Host sends every priority tier (scheduler_across_priorities) sorted by ID,
 	// not by priority. Reorder so a full high-priority credential falls through
 	// to the next tier instead of an unlimited lower-priority one jumping the queue.
@@ -372,16 +533,17 @@ func pickAuth(raw []byte) ([]byte, error) {
 			tiers[len(tiers)-1].candidates = append(tiers[len(tiers)-1].candidates, candidate)
 		}
 	}
+	// Only the top tier may create a pin. Binding a fallback would trap a
+	// session on a paid lower tier for the whole TTL even after the preferred
+	// credential frees up.
+	topPriority := req.Candidates[0].Priority
 
 	for _, tier := range tiers {
 		m := len(tier.candidates)
 		if m == 0 {
 			continue
 		}
-		rotKey := strconv.Itoa(tier.priority)
-		if len(tier.candidates) > 0 && strings.TrimSpace(tier.candidates[0].Provider) != "" {
-			rotKey = strings.TrimSpace(tier.candidates[0].Provider) + ":" + rotKey
-		}
+		rotKey := tierRotationKey(tier.candidates[0])
 		startIdx := 0
 		if cfg.rrProviders[strings.TrimSpace(tier.candidates[0].Provider)] {
 			if lastID, ok := inflight.lastPicked[rotKey]; ok && lastID != "" {
@@ -396,20 +558,13 @@ func pickAuth(raw []byte) ([]byte, error) {
 
 		for i := 0; i < m; i++ {
 			candidate := tier.candidates[(startIdx+i)%m]
-			limit := limitFor(cfg, candidate)
-			if limit <= 0 {
-				if inflight.lastPicked != nil {
-					inflight.lastPicked[rotKey] = candidate.ID
-				}
-				return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+			if !acquireSlot(candidate, limitFor(cfg, candidate), rotKey, now) {
+				continue
 			}
-			if int64(len(inflight.slots[candidate.ID])) < limit {
-				inflight.slots[candidate.ID] = append(inflight.slots[candidate.ID], now)
-				if inflight.lastPicked != nil {
-					inflight.lastPicked[rotKey] = candidate.ID
-				}
-				return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+			if bindKey != "" && !pinnedBusy && candidate.Priority == topPriority {
+				inflight.bindings[bindKey] = affinityBinding{authID: candidate.ID, at: now}
 			}
+			return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
 		}
 	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
@@ -468,7 +623,7 @@ func loadedConfig() pluginConfig {
 	if cfg, ok := raw.(pluginConfig); ok {
 		return cfg
 	}
-	return pluginConfig{slotTTL: 30 * time.Minute}
+	return pluginConfig{slotTTL: 30 * time.Minute, affinityTTL: time.Hour}
 }
 
 func okEnvelope(v any) ([]byte, error) {
