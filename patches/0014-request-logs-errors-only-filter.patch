@@ -1,0 +1,55 @@
+From 0d1d3a194198aeede20ff1acba396253f9abf8eb Mon Sep 17 00:00:00 2001
+From: Vonic <phanquochoipt@gmail.com>
+Date: Thu, 22 Oct 2026 21:25:11 +0700
+Subject: [PATCH] feat(request-logs): errors-only filter and clickable error
+ chip
+
+Failures were already recorded but sat among hundreds of successful rows, so
+they were effectively invisible when scanning the table. Add an "Errors only"
+option to the status filter (covers failed/rejected/canceled/stale and any
+4xx/5xx) and make the Error chip toggle it, so a failure is one click away.
+---
+ examples/plugin/request-logs/go/main.go | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/examples/plugin/request-logs/go/main.go b/examples/plugin/request-logs/go/main.go
+index a675cd8a..d55adb62 100644
+--- a/examples/plugin/request-logs/go/main.go
++++ b/examples/plugin/request-logs/go/main.go
+@@ -1196,13 +1196,13 @@ tr.err td{background:#1c1216}
+ <span class="chip">Total <b id="cTotal">0</b></span>
+ <span class="chip run">Running <b id="cRun">0</b></span>
+ <span class="chip ok">Success <b id="cOk">0</b></span>
+-<span class="chip err">Error <b id="cErr">0</b></span>
++<span class="chip err" id="cErrChip" title="Show errors only" onclick="showErrors()" style="cursor:pointer">Error <b id="cErr">0</b></span>
+ <span class="chip">Shown <b id="cShown">0</b></span>
+ <span id="runProv"></span>
+ </div>
+ <div class="controls">
+ <input id="q" placeholder="Search model, provider, account..." oninput="render()" size="26">
+-<select id="fStatus" onchange="render()"><option value="">All status</option><option value="run">Running</option><option value="2">2xx</option><option value="4">4xx</option><option value="5">5xx</option><option value="rej">Rejected/Canceled</option></select>
++<select id="fStatus" onchange="render()"><option value="">All status</option><option value="err">Errors only</option><option value="run">Running</option><option value="2">2xx</option><option value="4">4xx</option><option value="5">5xx</option><option value="rej">Rejected/Canceled</option></select>
+ <select id="fProv" onchange="render()"><option value="">All providers</option></select>
+ <select id="fModel" onchange="render()"><option value="">All models</option></select>
+ <select id="fAcct" onchange="render()"><option value="">All accounts</option></select>
+@@ -1263,6 +1263,7 @@ async function fetchData(){
+  }catch(e){/*keep old rows*/}
+ }
+ function saveKey(){KEY=document.getElementById('key').value.trim();localStorage.setItem('cpa-rl-key',KEY);live=true;document.getElementById('liveBtn').textContent='⏸ Pause';document.getElementById('livedot').className='dot on';fetchData();}
++function showErrors(){const s=document.getElementById('fStatus');s.value=s.value==='err'?'':'err';render();}
+ function render(){
+  const q=document.getElementById('q').value.toLowerCase();
+  const fs=document.getElementById('fStatus').value,fp=document.getElementById('fProv').value,fm=document.getElementById('fModel').value;
+@@ -1273,7 +1274,8 @@ function render(){
+  for(const e of view){
+   const running=e.outcome==='running';
+   const cls=running?'run':e.status>=500?'5':e.status>=400?'4':e.status>=200?'2':'rej';
+-  if(fs&&cls!==fs)continue;
++  if(fs==='err'){if(!(e.outcome==='failed'||e.outcome==='rejected'||e.outcome==='canceled'||e.outcome==='stale'||(e.status||0)>=400))continue}
++  else if(fs&&cls!==fs)continue;
+   if(fs==='rej'&&!(e.outcome==='rejected'||e.outcome==='canceled'||e.outcome==='stale'))continue;
+   if(fp&&e.provider!==fp&&!(e.attempts||[]).some(a=>a.provider===fp))continue;
+   if(fm&&e.model!==fm&&!(e.attempts||[]).some(a=>a.model===fm))continue;
+-- 
+2.50.1 (Apple Git-155)
+
