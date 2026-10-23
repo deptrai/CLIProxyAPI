@@ -486,6 +486,7 @@ func pickAuth(raw []byte) ([]byte, error) {
 	// the account holding its cached prefix even when a peer tier exists.
 	bindKey := ""
 	pinnedBusy := false
+	hadBinding := false
 	if cfg.SessionAffinity {
 		sweepBindings(now, cfg.affinityTTL)
 		if sessionID := sessionIdentity(req.Options); sessionID != "" {
@@ -495,6 +496,7 @@ func pickAuth(raw []byte) ([]byte, error) {
 			}
 			bindKey = providerKey + "::" + sessionID + "::" + strings.ToLower(strings.TrimSpace(req.Model))
 			if binding, ok := inflight.bindings[bindKey]; ok {
+				hadBinding = true
 				for _, candidate := range req.Candidates {
 					if candidate.ID != binding.authID {
 						continue
@@ -561,7 +563,11 @@ func pickAuth(raw []byte) ([]byte, error) {
 			if !acquireSlot(candidate, limitFor(cfg, candidate), rotKey, now) {
 				continue
 			}
-			if bindKey != "" && !pinnedBusy && candidate.Priority == topPriority {
+			// Never move an existing pin to another credential: a dead primary
+			// leaves the session unpinned for this request, so it snaps back as
+			// soon as the original credential returns instead of staying on the
+			// fallback for the rest of the TTL. Stale pins expire via affinityTTL.
+			if bindKey != "" && !pinnedBusy && !hadBinding && candidate.Priority == topPriority {
 				inflight.bindings[bindKey] = affinityBinding{authID: candidate.ID, at: now}
 			}
 			return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})

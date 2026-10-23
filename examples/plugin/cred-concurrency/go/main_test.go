@@ -603,3 +603,38 @@ func TestSessionAffinityDoesNotBindFallbackTier(t *testing.T) {
 		t.Fatalf("after recovery picked %s, want top tier 01-cle", next.AuthID)
 	}
 }
+
+func TestSessionAffinityReturnsToPrimaryAfterRecovery(t *testing.T) {
+	// A dead primary drops out of the candidate list. The session must fall back
+	// for that request WITHOUT stealing the pin, so it snaps back to the primary
+	// the moment it recovers instead of sitting on the fallback for the whole TTL.
+	seedAffinityConfig(t, nil)
+	resetInflight(t)
+	primaryOnly := `[
+		{"ID":"mm","Provider":"openai","Priority":30,"Metadata":{"max-concurrent":4}},
+		{"ID":"glm","Provider":"devin","Priority":22,"Metadata":{"max-concurrent":4}}
+	]`
+	fallbackOnly := `[
+		{"ID":"glm","Provider":"devin","Priority":22,"Metadata":{"max-concurrent":4}},
+		{"ID":"swe","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}
+	]`
+
+	first := pickWithSession(t, primaryOnly, "X-Session-ID", "recover-session")
+	if first.AuthID != "mm" {
+		t.Fatalf("first pick = %s, want primary mm", first.AuthID)
+	}
+	usage(t, first.AuthID)
+
+	// Primary dies: candidates no longer contain it.
+	during := pickWithSession(t, fallbackOnly, "X-Session-ID", "recover-session")
+	if during.AuthID != "glm" {
+		t.Fatalf("during outage picked %s, want fallback glm", during.AuthID)
+	}
+	usage(t, during.AuthID)
+
+	// Primary recovers: the session must return to it, not stay on the fallback.
+	after := pickWithSession(t, primaryOnly, "X-Session-ID", "recover-session")
+	if after.AuthID != "mm" {
+		t.Fatalf("after recovery picked %s, want primary mm again", after.AuthID)
+	}
+}
