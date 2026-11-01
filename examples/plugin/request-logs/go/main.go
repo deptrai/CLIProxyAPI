@@ -1142,30 +1142,28 @@ const pageHTML = `<!doctype html>
 :root{--bg:#0d0f14;--panel:#14171f;--border:#232733;--fg:#dbe1ea;--dim:#8b93a3;--ok:#34d399;--err:#f87171;--warn:#fbbf24;--accent:#60a5fa}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 -apple-system,"SF Pro","Segoe UI",Roboto,sans-serif}
-header{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--panel);flex-wrap:wrap}
+header{display:flex;align-items:center;gap:8px 10px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--panel);flex-wrap:wrap}
 h1{font-size:16px;margin:0;font-weight:600}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--err);display:inline-block}
 .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
-.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chips,.controls{display:contents}
+.grow{flex:1 1 0;min-width:0}
 .chip{padding:3px 10px;border:1px solid var(--border);border-radius:999px;color:var(--dim);background:#0f1219;cursor:default}
 .chip b{color:var(--fg)}
 .chip.ok b{color:var(--ok)} .chip.err b{color:var(--err)}
-.controls{display:flex;gap:8px;align-items:center;margin-left:auto;flex-wrap:wrap}
 input,select,button{background:#0f1219;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:6px 10px;font-size:12px}
 button{cursor:pointer} button:hover{border-color:var(--accent)}
 button.danger{color:var(--err)}
 .tablewrap{overflow-x:auto;width:100%}
 @media(max-width:1000px){
-  header{padding:10px 12px;gap:8px}
-  .controls{width:100%;margin-left:0}
-  .controls input#q{flex:1 1 100%}
-  .controls select{flex:1 1 140px;min-width:0}
+  header{padding:10px 12px}
+  .controls input#q{flex:1 1 160px;min-width:110px}
+  .controls select{flex:0 1 auto;max-width:180px}
   tbody td,thead th{padding:6px 8px}
 }
 @media(max-width:640px){
-  .chips{width:100%}
   .chip{font-size:11px;padding:2px 8px}
-  .controls select,.controls button{flex:1 1 auto}
+  .controls select{flex:1 1 130px}
 }
 table{width:100%;border-collapse:collapse;font-size:12px}
 thead th{position:sticky;top:0;background:var(--panel);color:var(--dim);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.4px;white-space:nowrap}
@@ -1214,6 +1212,7 @@ tr.err td{background:#1c1216}
 <span class="chip t-chip-shown">Shown <b id="cShown">0</b></span>
 <span id="runProv" class="t-chip-prov"></span>
 </div>
+<span class="grow"></span>
 <div class="controls">
 <input id="q" class="t-q" placeholder="Search model, provider, account..." oninput="render()" size="26">
 <select id="fStatus" class="t-status" onchange="render()"><option value="">All status</option><option value="err">Errors only</option><option value="run">Running</option><option value="2">2xx</option><option value="4">4xx</option><option value="5">5xx</option><option value="rej">Rejected/Canceled</option></select>
