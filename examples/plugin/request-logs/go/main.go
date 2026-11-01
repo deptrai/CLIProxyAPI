@@ -1154,6 +1154,19 @@ h1{font-size:16px;margin:0;font-weight:600}
 input,select,button{background:#0f1219;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:6px 10px;font-size:12px}
 button{cursor:pointer} button:hover{border-color:var(--accent)}
 button.danger{color:var(--err)}
+.tablewrap{overflow-x:auto;width:100%}
+@media(max-width:1000px){
+  header{padding:10px 12px;gap:8px}
+  .controls{width:100%;margin-left:0}
+  .controls input#q{flex:1 1 100%}
+  .controls select{flex:1 1 140px;min-width:0}
+  tbody td,thead th{padding:6px 8px}
+}
+@media(max-width:640px){
+  .chips{width:100%}
+  .chip{font-size:11px;padding:2px 8px}
+  .controls select,.controls button{flex:1 1 auto}
+}
 table{width:100%;border-collapse:collapse;font-size:12px}
 thead th{position:sticky;top:0;background:var(--panel);color:var(--dim);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.4px;white-space:nowrap}
 tbody td{padding:6px 10px;border-bottom:1px solid #1a1e28;white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}
@@ -1194,12 +1207,12 @@ tr.err td{background:#1c1216}
 <header>
 <span class="dot" id="livedot"></span><h1>Request Logs</h1>
 <div class="chips">
-<span class="chip">Total <b id="cTotal">0</b></span>
-<span class="chip run">Running <b id="cRun">0</b></span>
-<span class="chip ok">Success <b id="cOk">0</b></span>
-<span class="chip err" id="cErrChip" title="Show errors only" onclick="showErrors()" style="cursor:pointer">Error <b id="cErr">0</b></span>
-<span class="chip">Shown <b id="cShown">0</b></span>
-<span id="runProv"></span>
+<span class="chip t-chip-total">Total <b id="cTotal">0</b></span>
+<span class="chip run t-chip-run">Running <b id="cRun">0</b></span>
+<span class="chip ok t-chip-ok">Success <b id="cOk">0</b></span>
+<span class="chip err t-chip-err" id="cErrChip" title="Show errors only" onclick="showErrors()" style="cursor:pointer">Error <b id="cErr">0</b></span>
+<span class="chip t-chip-shown">Shown <b id="cShown">0</b></span>
+<span id="runProv" class="t-chip-prov"></span>
 </div>
 <div class="controls">
 <input id="q" class="t-q" placeholder="Search model, provider, account..." oninput="render()" size="26">
@@ -1218,9 +1231,9 @@ tr.err td{background:#1c1216}
 </header>
 <div id="ctlPanel"><div id="ctlList"></div></div>
 <div id="colPanel"><div id="colList"></div></div>
-<table><thead><tr>
+<div class="tablewrap"><table><thead><tr>
 <th class="c-status">Status</th><th class="c-model">Model</th><th class="c-requested">Requested</th><th class="c-provider">Provider</th><th class="c-account">Account</th><th class="c-apikey">API Key</th><th class="c-tokens">Tokens</th><th class="c-tps">TPS</th><th class="c-ttft">TTFT</th><th class="c-duration">Duration</th><th class="c-stream">Stream</th><th class="c-time">Time</th><th class="c-trace">Trace</th><th class="c-prompt">Prompt</th>
-</tr></thead><tbody id="tb"></tbody></table>
+</tr></thead><tbody id="tb"></tbody></table></div>
 <div class="empty" id="empty" style="display:none">No requests logged yet.</div>
 <script>
 let rows=[], live=true, openId=null, KEY=localStorage.getItem('cpa-rl-key')||'';
@@ -1233,7 +1246,7 @@ function renderColPanel(){
  COLS.forEach(([k,lab])=>{const lb=document.createElement('label');const cb=document.createElement('input');cb.type='checkbox';cb.checked=!hiddenCols.has(k);cb.onchange=()=>{if(cb.checked)hiddenCols.delete(k);else hiddenCols.add(k);localStorage.setItem('cpa-rl-cols',JSON.stringify([...hiddenCols]));applyCols()};lb.appendChild(cb);lb.appendChild(document.createTextNode(lab));l.appendChild(lb)});
 }
 applyCols();
-const CTLS=[['q','Search'],['status','Status'],['prov','Provider'],['model','Model'],['acct','Account'],['key','API Key'],['sort','Sort'],['live','Pause'],['refresh','Refresh'],['clear','Clean history']];
+const CTLS=[['q','Search'],['status','Status'],['prov','Provider'],['model','Model'],['acct','Account'],['key','API Key'],['sort','Sort'],['live','Pause'],['refresh','Refresh'],['clear','Clean history'],['chip-total','Chip Total'],['chip-run','Chip Running'],['chip-ok','Chip Success'],['chip-err','Chip Error'],['chip-shown','Chip Shown'],['chip-prov','Chip Providers']];
 let hiddenCtls=new Set(JSON.parse(localStorage.getItem('cpa-rl-ctls')||'[]'));
 function applyCtls(){document.getElementById('ctlstyle').textContent=[...hiddenCtls].map(k=>'.t-'+k+'{display:none}').join('');}
 function toggleCtlPanel(){const p=document.getElementById('ctlPanel');p.classList.toggle('open');if(p.classList.contains('open'))renderCtlPanel();}
