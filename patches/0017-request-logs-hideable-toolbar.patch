@@ -1,0 +1,72 @@
+diff --git a/examples/plugin/request-logs/go/main.go b/examples/plugin/request-logs/go/main.go
+index d55adb62..0ef5bdd8 100644
+--- a/examples/plugin/request-logs/go/main.go
++++ b/examples/plugin/request-logs/go/main.go
+@@ -1179,14 +1179,15 @@ tr.err td{background:#1c1216}
+ .detail td{background:#10141c;color:var(--dim);white-space:pre-wrap;word-break:break-all}
+ #auth{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:9}
+ #auth .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:24px;width:340px}
+-#colPanel{display:none;background:var(--panel);border-bottom:1px solid var(--border);padding:8px 14px}
+-#colPanel.open{display:block}
+-#colList{display:flex;flex-wrap:wrap;gap:10px}
+-#colList label{display:flex;gap:4px;align-items:center;color:#9aa4b5;font-size:11px;cursor:pointer;text-transform:uppercase}
++#colPanel,#ctlPanel{display:none;background:var(--panel);border-bottom:1px solid var(--border);padding:8px 14px}
++#colPanel.open,#ctlPanel.open{display:block}
++#colList,#ctlList{display:flex;flex-wrap:wrap;gap:10px}
++#colList label,#ctlList label{display:flex;gap:4px;align-items:center;color:#9aa4b5;font-size:11px;cursor:pointer;text-transform:uppercase}
+ #auth input{width:100%;margin:10px 0}
+ .empty{padding:40px;text-align:center;color:var(--dim)}
+ </style>
+ <style id="colstyle"></style>
++<style id="ctlstyle"></style>
+ </head>
+ <body>
+ <div id="auth"><div class="box"><b>Management key required</b><div class="dim" style="margin:6px 0">Enter the same secret used for <code>/v0/management</code></div><input id="key" type="password" placeholder="Management secret key"><button onclick="saveKey()">Save</button><div id="authmsg" class="dim"></div></div></div>
+@@ -1201,19 +1202,21 @@ tr.err td{background:#1c1216}
+ <span id="runProv"></span>
+ </div>
+ <div class="controls">
+-<input id="q" placeholder="Search model, provider, account..." oninput="render()" size="26">
+-<select id="fStatus" onchange="render()"><option value="">All status</option><option value="err">Errors only</option><option value="run">Running</option><option value="2">2xx</option><option value="4">4xx</option><option value="5">5xx</option><option value="rej">Rejected/Canceled</option></select>
+-<select id="fProv" onchange="render()"><option value="">All providers</option></select>
+-<select id="fModel" onchange="render()"><option value="">All models</option></select>
+-<select id="fAcct" onchange="render()"><option value="">All accounts</option></select>
+-<select id="fKey" onchange="render()"><option value="">All API keys</option></select>
+-<select id="fSort" onchange="render()"><option value="new">Newest</option><option value="old">Oldest</option><option value="dur">Duration ↓</option><option value="tok">Tokens ↓</option><option value="ttft">TTFT ↓</option></select>
+-<button onclick="toggleLive()" id="liveBtn">⏸ Pause</button>
++<input id="q" class="t-q" placeholder="Search model, provider, account..." oninput="render()" size="26">
++<select id="fStatus" class="t-status" onchange="render()"><option value="">All status</option><option value="err">Errors only</option><option value="run">Running</option><option value="2">2xx</option><option value="4">4xx</option><option value="5">5xx</option><option value="rej">Rejected/Canceled</option></select>
++<select id="fProv" class="t-prov" onchange="render()"><option value="">All providers</option></select>
++<select id="fModel" class="t-model" onchange="render()"><option value="">All models</option></select>
++<select id="fAcct" class="t-acct" onchange="render()"><option value="">All accounts</option></select>
++<select id="fKey" class="t-key" onchange="render()"><option value="">All API keys</option></select>
++<select id="fSort" class="t-sort" onchange="render()"><option value="new">Newest</option><option value="old">Oldest</option><option value="dur">Duration ↓</option><option value="tok">Tokens ↓</option><option value="ttft">TTFT ↓</option></select>
++<button onclick="toggleLive()" id="liveBtn" class="t-live">⏸ Pause</button>
++<button onclick="toggleCtlPanel()" title="Show/hide toolbar items">☰ Filters</button>
+ <button onclick="toggleColPanel()" title="Columns">☰ Cols</button>
+-<button onclick="refreshNow()" title="Refresh">⟳</button>
+-<button class="danger" onclick="clearLogs()">Clean history</button>
++<button onclick="refreshNow()" class="t-refresh" title="Refresh">⟳</button>
++<button class="danger t-clear" onclick="clearLogs()">Clean history</button>
+ </div>
+ </header>
++<div id="ctlPanel"><div id="ctlList"></div></div>
+ <div id="colPanel"><div id="colList"></div></div>
+ <table><thead><tr>
+ <th class="c-status">Status</th><th class="c-model">Model</th><th class="c-requested">Requested</th><th class="c-provider">Provider</th><th class="c-account">Account</th><th class="c-apikey">API Key</th><th class="c-tokens">Tokens</th><th class="c-tps">TPS</th><th class="c-ttft">TTFT</th><th class="c-duration">Duration</th><th class="c-stream">Stream</th><th class="c-time">Time</th><th class="c-trace">Trace</th><th class="c-prompt">Prompt</th>
+@@ -1230,6 +1233,15 @@ function renderColPanel(){
+  COLS.forEach(([k,lab])=>{const lb=document.createElement('label');const cb=document.createElement('input');cb.type='checkbox';cb.checked=!hiddenCols.has(k);cb.onchange=()=>{if(cb.checked)hiddenCols.delete(k);else hiddenCols.add(k);localStorage.setItem('cpa-rl-cols',JSON.stringify([...hiddenCols]));applyCols()};lb.appendChild(cb);lb.appendChild(document.createTextNode(lab));l.appendChild(lb)});
+ }
+ applyCols();
++const CTLS=[['q','Search'],['status','Status'],['prov','Provider'],['model','Model'],['acct','Account'],['key','API Key'],['sort','Sort'],['live','Pause'],['refresh','Refresh'],['clear','Clean history']];
++let hiddenCtls=new Set(JSON.parse(localStorage.getItem('cpa-rl-ctls')||'[]'));
++function applyCtls(){document.getElementById('ctlstyle').textContent=[...hiddenCtls].map(k=>'.t-'+k+'{display:none}').join('');}
++function toggleCtlPanel(){const p=document.getElementById('ctlPanel');p.classList.toggle('open');if(p.classList.contains('open'))renderCtlPanel();}
++function renderCtlPanel(){
++ const l=document.getElementById('ctlList');l.innerHTML='';
++ CTLS.forEach(([k,lab])=>{const lb=document.createElement('label');const cb=document.createElement('input');cb.type='checkbox';cb.checked=!hiddenCtls.has(k);cb.onchange=()=>{if(cb.checked)hiddenCtls.delete(k);else hiddenCtls.add(k);localStorage.setItem('cpa-rl-ctls',JSON.stringify([...hiddenCtls]));applyCtls()};lb.appendChild(cb);lb.appendChild(document.createTextNode(lab));l.appendChild(lb)});
++}
++applyCtls();
+ const DATA='/v0/management/request-logs/entries';
+ const CLEAR='/v0/management/request-logs/clear';
+ if(KEY)document.getElementById('auth').style.display='none';
