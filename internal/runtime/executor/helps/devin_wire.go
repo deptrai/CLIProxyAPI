@@ -48,6 +48,11 @@ const (
 	// DevinDefaultMaxTokens is the fallback max completion tokens.
 	DevinDefaultMaxTokens = 128000
 
+	// DevinMinTemperature is the smallest temperature the upstream Connect-RPC
+	// endpoint accepts. Zero or negative values are rejected with
+	// invalid_argument, so callers' zero-temperature requests are clamped up.
+	DevinMinTemperature = 0.01
+
 	maxConnectFrameSize      = 16 * 1024 * 1024
 	maxDecompressedFrameSize = 64 * 1024 * 1024
 )
@@ -431,6 +436,9 @@ func BuildDevinGetChatMessageRequest(
 	tempVal := 1.0
 	if temperature != nil {
 		tempVal = *temperature
+	}
+	if tempVal <= 0 {
+		tempVal = DevinMinTemperature
 	}
 	f8Bytes = protowire.AppendTag(f8Bytes, 5, protowire.Fixed64Type)
 	f8Bytes = protowire.AppendFixed64(f8Bytes, math.Float64bits(tempVal))

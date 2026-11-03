@@ -112,6 +112,44 @@ func TestBuildDevinGetChatMessageRequest(t *testing.T) {
 	}
 }
 
+func TestBuildDevinGetChatMessageRequest_TemperatureClamp(t *testing.T) {
+	prompts := []DevinPrompt{{MessageID: "m1", Source: 1, Content: "hi"}}
+
+	decodeTemp := func(temp *float64) float64 {
+		t.Helper()
+		req := BuildDevinGetChatMessageRequest("tok", "seed", "glm-5-3-flash-high", "", prompts, nil, temp, 1000, "s", "c", nil)
+		view, err := decodeDevinPayload(req, devinPayloadFields)
+		if err != nil {
+			t.Fatalf("decodeDevinPayload failed: %v", err)
+		}
+		cfg, ok := view["completion_config"].(map[string]any)
+		if !ok {
+			t.Fatalf("completion_config missing or wrong type: %T", view["completion_config"])
+		}
+		v, ok := cfg["temperature"].(float64)
+		if !ok {
+			t.Fatalf("temperature missing or wrong type: %T", cfg["temperature"])
+		}
+		return v
+	}
+
+	zero := 0.0
+	if got := decodeTemp(&zero); got != DevinMinTemperature {
+		t.Fatalf("temperature=0 must clamp to %v, got %v", DevinMinTemperature, got)
+	}
+	neg := -0.5
+	if got := decodeTemp(&neg); got != DevinMinTemperature {
+		t.Fatalf("temperature=-0.5 must clamp to %v, got %v", DevinMinTemperature, got)
+	}
+	pos := 0.7
+	if got := decodeTemp(&pos); got != 0.7 {
+		t.Fatalf("temperature=0.7 must pass through, got %v", got)
+	}
+	if got := decodeTemp(nil); got != 1.0 {
+		t.Fatalf("omitted temperature must default to 1.0, got %v", got)
+	}
+}
+
 func TestBuildDevinGetChatMessageRequest_SensitiveWordsOnlyInSystemPrompt(t *testing.T) {
 	matcher := BuildSensitiveWordMatcher([]string{"SECRET_TOKEN"})
 	prompts := []DevinPrompt{

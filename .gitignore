@@ -2,6 +2,10 @@
 cli-proxy-api
 *.exe
 
+# CGO shared-object build artifacts
+*.so
+*.h
+
 # Configuration
 config.yaml
 .env
