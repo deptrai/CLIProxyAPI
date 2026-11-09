@@ -206,6 +206,19 @@ type XAIConfig struct {
 type DevinConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system prompts and messages.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+
+	// Replacements rewrites exact substrings in the system prompt, message text
+	// and tool descriptions before a Devin request is built. Use it to break
+	// client identity fingerprints that the upstream rejects.
+	Replacements []DevinReplacement `yaml:"replacements,omitempty" json:"replacements,omitempty"`
+}
+
+// DevinReplacement is one exact-substring rewrite applied to Devin request text.
+type DevinReplacement struct {
+	// From is the exact substring to look for.
+	From string `yaml:"from" json:"from"`
+	// To is the text written in place of every From occurrence.
+	To string `yaml:"to" json:"to"`
 }
 
 // ProxyConnectionPoolConfig configures upstream connection reuse for one api-key

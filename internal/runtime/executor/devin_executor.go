@@ -427,6 +427,7 @@ func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *clipr
 		payload = translated.Body
 	}
 	systemPrompt, prompts, tools, temp, maxTokens, sessionID, cascadeID, thinkingLevel, budgetTokens := parseInteractionsPayload(payload, opts.OriginalRequest)
+	systemPrompt, prompts, tools = helps.ScrubDevinFingerprints(e.cfg, systemPrompt, prompts, tools)
 	// Translation drops Claude effort directives and keeps only the top-level
 	// effort, which directive-sending clients pin to a cache placeholder.
 	if opts.SourceFormat == sdktranslator.FormatClaude {
