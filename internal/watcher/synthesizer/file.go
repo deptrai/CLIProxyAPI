@@ -171,6 +171,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 				applyVertexOpenAPISettingsAttribute(auth, metadata)
 				ApplyAuthExcludedModelsMeta(auth, perAccountExcluded, "oauth")
 				coreauth.ApplyCustomHeadersFromMetadata(auth)
+				applyMaxConcurrentAttribute(auth, metadata)
 				applyFingerprintProfileAttribute(auth, metadata)
 				auth.BindFileSnapshot(fullPath, data)
 			}
@@ -250,6 +251,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
+	applyMaxConcurrentAttribute(a, metadata)
 	applyOpenAPIModelsAttribute(a, metadata)
 	applyVertexOpenAPISettingsAttribute(a, metadata)
 	ApplyAuthExcludedModelsMeta(a, perAccountExcluded, "oauth")
@@ -426,6 +428,36 @@ func applyVertexOpenAPISettingsAttribute(auth *coreauth.Auth, metadata map[strin
 	if len(rules) > 0 {
 		if data, errMarshal := json.Marshal(rules); errMarshal == nil {
 			auth.Attributes["vertex_model_openapi"] = string(data)
+		}
+	}
+}
+
+// applyMaxConcurrentAttribute propagates the credential's max_concurrent setting
+// into auth attributes so scheduler plugins can enforce per-auth concurrency
+// even when their configured limits are keyed by a stale auth ID (e.g. after a
+// file rename).
+func applyMaxConcurrentAttribute(auth *coreauth.Auth, metadata map[string]any) {
+	if auth == nil || metadata == nil {
+		return
+	}
+	for _, key := range []string{"max_concurrent", "max-concurrent"} {
+		raw, ok := metadata[key]
+		if !ok || raw == nil {
+			continue
+		}
+		switch v := raw.(type) {
+		case float64:
+			if n := int64(v); n > 0 {
+				auth.Attributes["max_concurrent"] = strconv.FormatInt(n, 10)
+				return
+			}
+		case string:
+			// Only accept positive integers; a negative or non-numeric value
+			// must not silently disable the concurrency cap.
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+				auth.Attributes["max_concurrent"] = strconv.Itoa(n)
+				return
+			}
 		}
 	}
 }

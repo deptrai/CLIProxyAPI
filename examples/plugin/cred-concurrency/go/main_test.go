@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -636,5 +637,256 @@ func TestSessionAffinityReturnsToPrimaryAfterRecovery(t *testing.T) {
 	after := pickWithSession(t, primaryOnly, "X-Session-ID", "recover-session")
 	if after.AuthID != "mm" {
 		t.Fatalf("after recovery picked %s, want primary mm again", after.AuthID)
+	}
+}
+
+// TestLimitForResolutionOrder pins the precedence used to resolve a candidate's
+// concurrency cap: configured limit keyed by auth ID wins, then the
+// max_concurrent metadata, then the max_concurrent attribute; absence means
+// unlimited (0).
+func TestLimitForResolutionOrder(t *testing.T) {
+	cfg := pluginConfig{Limits: map[string]int64{"a": 3}}
+	for _, tc := range []struct {
+		name      string
+		candidate pluginapi.SchedulerAuthCandidate
+		want      int64
+	}{
+		{name: "config wins", candidate: pluginapi.SchedulerAuthCandidate{ID: "a", Metadata: map[string]any{"max_concurrent": 9}}, want: 3},
+		{name: "metadata fallback", candidate: pluginapi.SchedulerAuthCandidate{ID: "b", Metadata: map[string]any{"max_concurrent": 4}}, want: 4},
+		{name: "legacy metadata key", candidate: pluginapi.SchedulerAuthCandidate{ID: "c", Metadata: map[string]any{"max-concurrent": 6}}, want: 6},
+		{name: "attribute fallback", candidate: pluginapi.SchedulerAuthCandidate{ID: "d", Attributes: map[string]string{"max_concurrent": "2"}}, want: 2},
+		{name: "legacy attribute key", candidate: pluginapi.SchedulerAuthCandidate{ID: "e", Attributes: map[string]string{"max-concurrent": "7"}}, want: 7},
+		{name: "unlimited when absent", candidate: pluginapi.SchedulerAuthCandidate{ID: "f"}, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := limitFor(cfg, tc.candidate); got != tc.want {
+				t.Fatalf("limitFor() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPickRenamedCredentialKeepsAttributeLimit is a regression test for the
+// incident where a renamed auth file became unlimited: the configured limits
+// still keyed the old filename, and the credential carried its cap only via
+// the max_concurrent attribute. The attribute must keep the credential capped
+// so overflow still reaches the lower-priority tier.
+func TestPickRenamedCredentialKeepsAttributeLimit(t *testing.T) {
+	currentConfig.Store(pluginConfig{
+		slotTTL: 30 * time.Minute,
+		Limits:  map[string]int64{"devin-user-5a0a4ed9f34fc45e-flash.json": 2},
+	})
+	t.Cleanup(func() {
+		currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute})
+		inflight.Lock()
+		inflight.slots = map[string][]time.Time{}
+		inflight.lastPicked = map[string]string{}
+		inflight.swept = map[string]int{}
+		inflight.Unlock()
+	})
+
+	cands := `[
+		{"ID":"devin-phanquochoipt-flash.json","Provider":"devin","Priority":22,"Attributes":{"max_concurrent":"2"}},
+		{"ID":"devin-epsilon-flash.json","Provider":"devin","Priority":20,"Attributes":{"max_concurrent":"2"}}
+	]`
+
+	// The stale configured key matches neither candidate, so the renamed
+	// credential still enforces its attribute cap of 2.
+	for i := 0; i < 2; i++ {
+		if r := pick(t, cands); r.AuthID != "devin-phanquochoipt-flash.json" {
+			t.Fatalf("pick %d = %s, want pha", i+1, r.AuthID)
+		}
+	}
+	// pha is full via its attribute limit: overflow must reach eps, not queue
+	// behind pha nor silently absorb extra concurrency.
+	for i := 0; i < 2; i++ {
+		if r := pick(t, cands); r.AuthID != "devin-epsilon-flash.json" {
+			t.Fatalf("overflow pick %d = %s, want eps", i+1, r.AuthID)
+		}
+	}
+	if r := pick(t, cands); !r.Reject {
+		t.Fatalf("saturated pick = %+v, want reject", r)
+	}
+}
+
+// seedWaitTimeoutConfig stores a config with the given wait_timeout duration so
+// pickAuth exercises the retry loop instead of the fail-fast path.
+func seedWaitTimeoutConfig(t *testing.T, waitTimeout time.Duration) {
+	t.Helper()
+	currentConfig.Store(pluginConfig{
+		slotTTL:     30 * time.Minute,
+		affinityTTL: time.Hour,
+		waitTimeout: waitTimeout,
+	})
+	t.Cleanup(func() { currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute}) })
+}
+
+// pickBody wraps a candidates JSON fragment into a full scheduler.pick request.
+func pickBody(candidates string) map[string]any {
+	return map[string]any{
+		"provider":   "devin",
+		"candidates": json.RawMessage(candidates),
+	}
+}
+
+// pickAsync runs scheduler.pick on a goroutine so the test can hold or release
+// slots while the call is blocked in the wait_timeout retry loop. Marshal and
+// handleMethod errors inside the goroutine are reported via the result payload.
+func pickAsync(t *testing.T, candidates string) <-chan pluginapiPickResponse {
+	t.Helper()
+	ch := make(chan pluginapiPickResponse, 1)
+	rawReq, errMarshal := json.Marshal(pickBody(candidates))
+	if errMarshal != nil {
+		t.Fatalf("marshal: %v", errMarshal)
+	}
+	go func() {
+		raw, err := handleMethod("scheduler.pick", rawReq)
+		if err != nil {
+			ch <- pluginapiPickResponse{RejectReason: "pick error: " + err.Error()}
+			return
+		}
+		var env envelope
+		if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+			ch <- pluginapiPickResponse{RejectReason: "envelope error: " + errUnmarshal.Error()}
+			return
+		}
+		if !env.OK {
+			ch <- pluginapiPickResponse{RejectReason: "pick not ok: " + string(raw)}
+		}
+		var resp pluginapiPickResponse
+		if errUnmarshal := json.Unmarshal(env.Result, &resp); errUnmarshal != nil {
+			ch <- pluginapiPickResponse{RejectReason: "result error: " + errUnmarshal.Error()}
+			return
+		}
+		ch <- resp
+	}()
+	return ch
+}
+
+// waitPickResult collects a pick result or fails the test if none arrives
+// before the deadline, proving the call did not hang.
+func waitPickResult(t *testing.T, ch <-chan pluginapiPickResponse, timeout time.Duration) pluginapiPickResponse {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(timeout):
+		t.Fatal("pick did not return before deadline")
+		return pluginapiPickResponse{}
+	}
+}
+
+const singleLimitedCredential = `[
+	{"ID":"eps","Provider":"devin","Priority":20,"Metadata":{"max-concurrent":1}}
+]`
+
+func TestConfigureWaitTimeout(t *testing.T) {
+	registerWithWaitTimeout := func(t *testing.T, value string) error {
+		t.Helper()
+		cfgYAML, _ := yaml.Marshal(map[string]any{"wait_timeout": value})
+		req, _ := json.Marshal(map[string]any{"config_yaml": cfgYAML})
+		_, err := handleMethod("plugin.register", req)
+		return err
+	}
+
+	for _, bad := range []string{"bogus", "-5ms", "10x"} {
+		if err := registerWithWaitTimeout(t, bad); err == nil {
+			t.Fatalf("wait_timeout %q: expected configure error, got nil", bad)
+		}
+	}
+
+	// A rejected configure must not overwrite the previously stored config.
+	currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute})
+	if err := registerWithWaitTimeout(t, "-1s"); err == nil {
+		t.Fatal("negative wait_timeout: expected error, got nil")
+	}
+	if got := loadedConfig().waitTimeout; got != 0 {
+		t.Fatalf("waitTimeout = %v after failed configure, want 0", got)
+	}
+
+	if err := registerWithWaitTimeout(t, "500ms"); err != nil {
+		t.Fatalf("wait_timeout 500ms: unexpected error: %v", err)
+	}
+	if got := loadedConfig().waitTimeout; got != 500*time.Millisecond {
+		t.Fatalf("waitTimeout = %v, want 500ms", got)
+	}
+	// Empty/zero keep the fail-fast path.
+	for _, zero := range []string{"", "0s"} {
+		if err := registerWithWaitTimeout(t, zero); err != nil {
+			t.Fatalf("wait_timeout %q: unexpected error: %v", zero, err)
+		}
+		if got := loadedConfig().waitTimeout; got != 0 {
+			t.Fatalf("wait_timeout %q: waitTimeout = %v, want 0", zero, got)
+		}
+	}
+
+	t.Cleanup(func() { currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute}) })
+}
+
+func TestPickWaitTimeoutRetrySucceeds(t *testing.T) {
+	seedWaitTimeoutConfig(t, 2*time.Second)
+	resetInflight(t)
+
+	// Occupy the only limited credential so the first attempt rejects.
+	if r := pick(t, singleLimitedCredential); r.AuthID != "eps" || !r.Handled {
+		t.Fatalf("initial pick = %+v, want eps", r)
+	}
+
+	resultCh := pickAsync(t, singleLimitedCredential)
+	// Give the goroutine time to run its first (rejected) attempt and enter the
+	// retry sleep; the pick must still be pending, proving it is waiting.
+	select {
+	case r := <-resultCh:
+		t.Fatalf("pick returned %s before the slot was released", r.AuthID)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Free the slot mid-wait; the next retry must acquire it and succeed.
+	usage(t, "eps")
+	r := waitPickResult(t, resultCh, 3*time.Second)
+	if !r.Handled || r.AuthID != "eps" {
+		t.Fatalf("waiting pick = %+v, want handled eps", r)
+	}
+}
+
+func TestPickWaitTimeoutDeadlineRejects(t *testing.T) {
+	seedWaitTimeoutConfig(t, 10*time.Millisecond)
+	resetInflight(t)
+
+	if r := pick(t, singleLimitedCredential); r.AuthID != "eps" || !r.Handled {
+		t.Fatalf("initial pick = %+v, want eps", r)
+	}
+
+	// The credential stays busy for the whole window: the loop must give up at
+	// the deadline and return the reject envelope instead of hanging.
+	start := time.Now()
+	r := pick(t, singleLimitedCredential)
+	elapsed := time.Since(start)
+	if !r.Reject || r.RejectCode != "auth_unavailable" {
+		t.Fatalf("pick = %+v, want auth_unavailable reject", r)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("pick took %v, expected bounded wait near wait_timeout", elapsed)
+	}
+}
+
+func TestPickFailFastWithoutWaitTimeout(t *testing.T) {
+	// waitTimeout unset: a rejected pick must return immediately with no 250ms
+	// retry sleep. The bound is generous so slow CI cannot flake it.
+	seedConfig(t, nil)
+	resetInflight(t)
+
+	if r := pick(t, singleLimitedCredential); r.AuthID != "eps" || !r.Handled {
+		t.Fatalf("initial pick = %+v, want eps", r)
+	}
+
+	start := time.Now()
+	r := pick(t, singleLimitedCredential)
+	elapsed := time.Since(start)
+	if !r.Reject {
+		t.Fatalf("pick = %+v, want reject", r)
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("fail-fast pick took %v, expected no retry sleep", elapsed)
 	}
 }

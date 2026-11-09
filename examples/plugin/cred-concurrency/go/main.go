@@ -118,10 +118,17 @@ type pluginConfig struct {
 	// SessionAffinityTTL bounds how long a binding survives without a fresh
 	// pick. Defaults to 1h.
 	SessionAffinityTTL string `yaml:"session_affinity_ttl"`
+	// WaitTimeout, when positive, makes the scheduler retry a rejected pick
+	// (all limited credentials busy) until a slot frees or the timeout
+	// elapses, instead of failing fast with 503. Each retry re-locks and
+	// re-scans, so waiting requests do not block other scheduling decisions.
+	// Zero or empty keeps the fail-fast behavior.
+	WaitTimeout string `yaml:"wait_timeout"`
 
 	slotTTL     time.Duration
 	rrProviders map[string]bool
 	affinityTTL time.Duration
+	waitTimeout time.Duration
 }
 
 type registration struct {
@@ -236,6 +243,17 @@ func configure(raw []byte) error {
 	}
 	if cfg.affinityTTL <= 0 {
 		return errors.New("session_affinity_ttl must be a positive duration")
+	}
+	cfg.waitTimeout = 0
+	if trimmed := strings.TrimSpace(cfg.WaitTimeout); trimmed != "" {
+		parsed, errParse := time.ParseDuration(trimmed)
+		if errParse != nil {
+			return errParse
+		}
+		if parsed < 0 {
+			return errors.New("wait_timeout must not be negative")
+		}
+		cfg.waitTimeout = parsed
 	}
 	cfg.rrProviders = map[string]bool{}
 	for _, provider := range cfg.RoundRobinProviders {
@@ -452,16 +470,38 @@ func tierRotationKey(candidate pluginapi.SchedulerAuthCandidate) string {
 }
 
 func pickAuth(raw []byte) ([]byte, error) {
+	cfg := loadedConfig()
+	if cfg.waitTimeout <= 0 {
+		resp, errPick := pickAuthAttempt(raw)
+		if errPick != nil {
+			return nil, errPick
+		}
+		return okEnvelope(resp)
+	}
+	deadline := time.Now().Add(cfg.waitTimeout)
+	for {
+		resp, errPick := pickAuthAttempt(raw)
+		if errPick != nil {
+			return nil, errPick
+		}
+		if !resp.Reject || time.Now().Add(250*time.Millisecond).After(deadline) {
+			return okEnvelope(resp)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func pickAuthAttempt(raw []byte) (pluginapi.SchedulerPickResponse, error) {
 	var req pluginapi.SchedulerPickRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, errUnmarshal
+		return pluginapi.SchedulerPickResponse{}, errUnmarshal
 	}
 	// Token-count routes never emit usage records, so any slot acquired for
 	// them would be held until slot_ttl and brick the credential. Defer to the
 	// builtin scheduler (still priority-ordered) without consuming a slot.
 	if path, ok := req.Options.Metadata["request_path"].(string); ok &&
 		strings.HasSuffix(path, "/count_tokens") {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
 	cfg := loadedConfig()
 
@@ -474,7 +514,7 @@ func pickAuth(raw []byte) ([]byte, error) {
 		}
 	}
 	if !hasLimited {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
 
 	now := time.Now()
@@ -504,7 +544,7 @@ func pickAuth(raw []byte) ([]byte, error) {
 					// Busy is transient: fail over for this request but keep the
 					// pin so the session returns once the slot frees.
 					if acquireSlot(candidate, limitFor(cfg, candidate), tierRotationKey(candidate), now) {
-						return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+						return pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true}, nil
 					}
 					pinnedBusy = true
 					break
@@ -570,15 +610,15 @@ func pickAuth(raw []byte) ([]byte, error) {
 			if bindKey != "" && !pinnedBusy && !hadBinding && candidate.Priority == topPriority {
 				inflight.bindings[bindKey] = affinityBinding{authID: candidate.ID, at: now}
 			}
-			return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true})
+			return pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true}, nil
 		}
 	}
-	return okEnvelope(pluginapi.SchedulerPickResponse{
+	return pluginapi.SchedulerPickResponse{
 		Handled:      true,
 		Reject:       true,
 		RejectCode:   "auth_unavailable",
 		RejectReason: "all concurrency-limited credentials are busy",
-	})
+	}, nil
 }
 
 func releaseSlot(raw []byte) ([]byte, error) {
