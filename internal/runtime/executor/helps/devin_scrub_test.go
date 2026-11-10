@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
@@ -74,5 +75,40 @@ func TestScrubDevinFingerprintsCoversSystemPromptsAndTools(t *testing.T) {
 	}
 	if strings.Contains(gotTools[0].Description, "Reads a file from the local filesystem") {
 		t.Errorf("tool description keeps fingerprint: %q", gotTools[0].Description)
+	}
+}
+
+func TestTrimDevinPayloadForPolicyRetryKeepsSystemAndLastUser(t *testing.T) {
+	payload := []byte(`{"model":"claude-opus-5","messages":[{"role":"system","content":"be helpful"},{"role":"user","content":"first turn"},{"role":"assistant","content":"reply"},{"role":"user","content":"latest turn"}],"max_tokens":100}`)
+	got, ok := TrimDevinPayloadForPolicyRetry(payload)
+	if !ok {
+		t.Fatal("expected trim to succeed")
+	}
+	root := ojson.NewDoc(got)
+	msgs := root.Get("messages").Array()
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages kept, got %d (%s)", len(msgs), root.String())
+	}
+	if msgs[0].Get("role").String() != "system" || msgs[0].Get("content").String() != "be helpful" {
+		t.Fatalf("system turn lost: %s", msgs[0].Raw)
+	}
+	if msgs[1].Get("role").String() != "user" || msgs[1].Get("content").String() != "latest turn" {
+		t.Fatalf("last user turn not kept: %s", msgs[1].Raw)
+	}
+	if root.Get("model").String() != "claude-opus-5" || root.Get("max_tokens").Int() != 100 {
+		t.Fatalf("non-message fields must survive, got %s", root.String())
+	}
+}
+
+func TestTrimDevinPayloadForPolicyRetryRejectsMissingUser(t *testing.T) {
+	cases := [][]byte{
+		[]byte(`{"messages":[{"role":"system","content":"only system"},{"role":"assistant","content":"reply"}]}`),
+		[]byte(`{"prompt":"no messages array"}`),
+		[]byte(`not json`),
+	}
+	for _, payload := range cases {
+		if _, ok := TrimDevinPayloadForPolicyRetry(payload); ok {
+			t.Fatalf("expected trim to fail for %s", payload)
+		}
 	}
 }

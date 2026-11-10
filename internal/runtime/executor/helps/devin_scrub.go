@@ -3,6 +3,7 @@ package helps
 import (
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
@@ -112,4 +113,38 @@ func ScrubDevinFingerprints(cfg *config.Config, systemPrompt string, prompts []D
 		tools[i].Description = ApplyDevinTextReplacements(tools[i].Description, rules)
 	}
 	return systemPrompt, prompts, tools
+}
+
+// TrimDevinPayloadForPolicyRetry shrinks a chat payload to its system
+// messages plus the last user message. Devin's content filter refuses the
+// whole request (permission_denied) when accumulated history trips a rule,
+// so a single retry without the flagged history is the last chance before
+// the caller falls through to another provider. Returns false when the
+// payload has no messages array or no user turn to keep.
+func TrimDevinPayloadForPolicyRetry(payload []byte) ([]byte, bool) {
+	doc := ojson.NewDoc(payload)
+	messages := doc.Get("messages")
+	if !messages.IsArray() {
+		return nil, false
+	}
+	kept := make([]string, 0, 2)
+	var lastUser string
+	foundUser := false
+	for _, msg := range messages.Array() {
+		switch msg.Get("role").String() {
+		case "system", "developer":
+			kept = append(kept, msg.Raw)
+		case "user":
+			lastUser = msg.Raw
+			foundUser = true
+		}
+	}
+	if !foundUser {
+		return nil, false
+	}
+	kept = append(kept, lastUser)
+	if err := doc.SetRaw("messages", "["+strings.Join(kept, ",")+"]"); err != nil {
+		return nil, false
+	}
+	return doc.Bytes(), true
 }

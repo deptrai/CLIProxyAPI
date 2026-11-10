@@ -229,30 +229,71 @@ func ReadConnectFrame(r io.Reader) (flag byte, payload []byte, err error) {
 	}
 
 	if flag&ConnectFlagCompressed != 0 {
-		gz, errGz := gzip.NewReader(bytes.NewReader(payload))
-		if errGz != nil {
-			return flag, nil, fmt.Errorf("decompress gzip connect frame: %w", errGz)
+		decompressed, errDecompress := decompressConnectFramePayload(payload)
+		if errDecompress != nil {
+			return flag, nil, errDecompress
 		}
-		defer func() { _ = gz.Close() }()
-
-		initCap := int(length) * 4
-		if initCap > 4*1024*1024 {
-			initCap = 4 * 1024 * 1024
-		} else if initCap < 4096 {
-			initCap = 4096
-		}
-		decompBuf := bytes.NewBuffer(make([]byte, 0, initCap))
-		limitedReader := io.LimitReader(gz, maxDecompressedFrameSize+1)
-		if _, errRead := decompBuf.ReadFrom(limitedReader); errRead != nil {
-			return flag, nil, fmt.Errorf("read decompressed connect frame: %w", errRead)
-		}
-		if decompBuf.Len() > maxDecompressedFrameSize {
-			return flag, nil, fmt.Errorf("decompressed frame size exceeds maximum limit (%d)", maxDecompressedFrameSize)
-		}
-		payload = decompBuf.Bytes()
+		payload = decompressed
 	}
 
 	return flag, payload, nil
+}
+
+// ReadConnectFrameWire reads one Connect-proto frame preserving the wire
+// payload verbatim (compressed bytes stay compressed), so callers may replay
+// it without re-encoding.
+func ReadConnectFrameWire(r io.Reader) (flag byte, wire []byte, err error) {
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return 0, nil, err
+	}
+	flag = header[0]
+	if flag != ConnectFlagData && flag != ConnectFlagCompressed && flag != ConnectFlagEndStream && flag != (ConnectFlagCompressed|ConnectFlagEndStream) {
+		return flag, nil, fmt.Errorf("invalid connect frame flag: 0x%02x", flag)
+	}
+	length := binary.BigEndian.Uint32(header[1:5])
+	if length > maxConnectFrameSize {
+		return flag, nil, fmt.Errorf("connect frame length %d exceeds maximum limit (%d)", length, maxConnectFrameSize)
+	}
+
+	wire = make([]byte, length)
+	if _, err := io.ReadFull(r, wire); err != nil {
+		return 0, nil, err
+	}
+	return flag, wire, nil
+}
+
+// DecompressConnectFramePayload returns the decoded frame payload, gunzipping
+// it only when the flag carries the compressed bit.
+func DecompressConnectFramePayload(flag byte, payload []byte) ([]byte, error) {
+	if flag&ConnectFlagCompressed == 0 {
+		return payload, nil
+	}
+	return decompressConnectFramePayload(payload)
+}
+
+func decompressConnectFramePayload(payload []byte) ([]byte, error) {
+	gz, errGz := gzip.NewReader(bytes.NewReader(payload))
+	if errGz != nil {
+		return nil, fmt.Errorf("decompress gzip connect frame: %w", errGz)
+	}
+	defer func() { _ = gz.Close() }()
+
+	initCap := len(payload) * 4
+	if initCap > 4*1024*1024 {
+		initCap = 4 * 1024 * 1024
+	} else if initCap < 4096 {
+		initCap = 4096
+	}
+	decompBuf := bytes.NewBuffer(make([]byte, 0, initCap))
+	limitedReader := io.LimitReader(gz, maxDecompressedFrameSize+1)
+	if _, errRead := decompBuf.ReadFrom(limitedReader); errRead != nil {
+		return nil, fmt.Errorf("read decompressed connect frame: %w", errRead)
+	}
+	if decompBuf.Len() > maxDecompressedFrameSize {
+		return nil, fmt.Errorf("decompressed frame size exceeds maximum limit (%d)", maxDecompressedFrameSize)
+	}
+	return decompBuf.Bytes(), nil
 }
 
 // BuildDevinClientMetadataBytes constructs the serialized bytes for Field 1 (ClientMetadata).

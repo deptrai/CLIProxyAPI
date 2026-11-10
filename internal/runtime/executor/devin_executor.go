@@ -247,86 +247,99 @@ func (e *DevinExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter := helps.NewExecutorUsageReporter(ctx, e, targetModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	httpReq, chatModelUID, logBody, errPrep := e.prepareDevinHTTPRequest(ctx, auth, req, opts)
-	if errPrep != nil {
-		return resp, errPrep
-	}
-	if chatModelUID != "" {
-		reporter.SetUpstreamModel(chatModelUID)
-	}
-
 	authID, authLabel, authType, authValue := devinAuthLogFields(auth)
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       httpReq.URL.String(),
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      logBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
 	httpClient := reporter.TrackHTTPClient(helps.NewDevinHTTPClient(ctx, e.cfg, auth, 0))
-	httpResp, errDo := httpClient.Do(httpReq)
-	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		return resp, errDo
-	}
-	defer func() {
-		_ = httpResp.Body.Close()
-	}()
 
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		errData, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
-		helps.AppendAPIResponseChunk(ctx, e.cfg, errData)
-		return resp, newDevinStatusErrorForAuth(httpResp.StatusCode, httpResp.Header, errData, auth)
-	}
-
-	interactionsJSON, respLog, errConsume := consumeDevinFramesToInteractionsForAuth(httpResp.Body, req.Model, chatModelUID, auth, helps.ApplyPatchOriginalRequest(req, opts))
-	if respLog != nil || len(interactionsJSON) > 0 {
-		logRespBody := helps.BuildDevinUpstreamResponseLogBody(respLog, interactionsJSON)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, logRespBody)
-	}
-	var patchDiagnostics *helps.DevinApplyPatchDiagnostics
-	if respLog != nil {
-		patchDiagnostics = respLog.ApplyPatchDiagnostics
-	}
-	if errConsume != nil {
-		original := opts.OriginalRequest
-		if len(original) == 0 {
-			original = req.Payload
+	attempt := func(attemptReq cliproxyexecutor.Request) (cliproxyexecutor.Response, error) {
+		httpReq, chatModelUID, logBody, errPrep := e.prepareDevinHTTPRequest(ctx, auth, attemptReq, opts)
+		if errPrep != nil {
+			return cliproxyexecutor.Response{}, errPrep
 		}
-		if helps.ApplyPatchRequested(original) {
-			var patchErr statusErr
-			if errors.As(errConsume, &patchErr) && patchErr.diagnostic != "" {
-				return resp, patchErr
+		if chatModelUID != "" {
+			reporter.SetUpstreamModel(chatModelUID)
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       httpReq.URL.String(),
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      logBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			return cliproxyexecutor.Response{}, errDo
+		}
+		defer func() {
+			_ = httpResp.Body.Close()
+		}()
+
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			errData, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			helps.AppendAPIResponseChunk(ctx, e.cfg, errData)
+			return cliproxyexecutor.Response{}, newDevinStatusErrorForAuth(httpResp.StatusCode, httpResp.Header, errData, auth)
+		}
+
+		interactionsJSON, respLog, errConsume := consumeDevinFramesToInteractionsForAuth(httpResp.Body, attemptReq.Model, chatModelUID, auth, helps.ApplyPatchOriginalRequest(attemptReq, opts))
+		if respLog != nil || len(interactionsJSON) > 0 {
+			logRespBody := helps.BuildDevinUpstreamResponseLogBody(respLog, interactionsJSON)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, logRespBody)
+		}
+		var patchDiagnostics *helps.DevinApplyPatchDiagnostics
+		if respLog != nil {
+			patchDiagnostics = respLog.ApplyPatchDiagnostics
+		}
+		if errConsume != nil {
+			original := opts.OriginalRequest
+			if len(original) == 0 {
+				original = attemptReq.Payload
 			}
-			return resp, devinApplyPatchStatusError(patchDiagnostics.Render(nil, devinApplyPatchConsumeReason(respLog, errConsume)))
+			if helps.ApplyPatchRequested(original) {
+				var patchErr statusErr
+				if errors.As(errConsume, &patchErr) && patchErr.diagnostic != "" {
+					return cliproxyexecutor.Response{}, patchErr
+				}
+				return cliproxyexecutor.Response{}, devinApplyPatchStatusError(patchDiagnostics.Render(nil, devinApplyPatchConsumeReason(respLog, errConsume)))
+			}
+			if ctx.Err() == nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errConsume)
+			}
+			return cliproxyexecutor.Response{}, errConsume
 		}
-		if ctx.Err() == nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errConsume)
+
+		if respLog != nil && respLog.Usage != nil && respLog.Usage.ModelName != "" {
+			reporter.SetResponseModel(respLog.Usage.ModelName)
 		}
-		return resp, errConsume
+
+		targetFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FormatInteractions, targetFormat, attemptReq.Model, helps.ApplyPatchOriginalRequest(attemptReq, opts), attemptReq.Payload, interactionsJSON, &param)
+		if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
+			return cliproxyexecutor.Response{}, devinApplyPatchStatusError(patchDiagnostics.Render(param, ""))
+		}
+		reporter.Publish(ctx, helps.ParseInteractionsUsage(interactionsJSON))
+		if targetFormat == sdktranslator.FormatOpenAIResponse {
+			out = helps.EnsureResponsesUsageDetails(out)
+		}
+		return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
 	}
 
-	if respLog != nil && respLog.Usage != nil && respLog.Usage.ModelName != "" {
-		reporter.SetResponseModel(respLog.Usage.ModelName)
+	respOut, errExec := attempt(req)
+	if isDevinPermissionDeniedErr(errExec) {
+		if reqTrim, okTrim := trimDevinPolicyRetryRequest(req); okTrim {
+			log.Warnf("devin executor: permission_denied on full context, retrying with trimmed conversation")
+			if respTrim, errTrim := attempt(reqTrim); errTrim == nil {
+				return respTrim, nil
+			}
+		}
 	}
-
-	targetFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	var param any
-	out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FormatInteractions, targetFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), req.Payload, interactionsJSON, &param)
-	if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
-		return cliproxyexecutor.Response{}, devinApplyPatchStatusError(patchDiagnostics.Render(param, ""))
-	}
-	reporter.Publish(ctx, helps.ParseInteractionsUsage(interactionsJSON))
-	if targetFormat == sdktranslator.FormatOpenAIResponse {
-		out = helps.EnsureResponsesUsageDetails(out)
-	}
-	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
+	return respOut, errExec
 }
 
 // ExecuteStream performs streaming execution against the Devin backend.
@@ -391,13 +404,81 @@ func (e *DevinExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	go func() {
 		defer close(out)
 		defer cancelStream()
+
+		body := io.Reader(httpResp.Body)
+		bodyCloser := httpResp.Body
 		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
+			if errClose := bodyCloser.Close(); errClose != nil {
 				log.Errorf("devin executor: close stream body error: %v", errClose)
 			}
 		}()
 
-		e.streamDevinFramesForAuth(streamCtx, httpResp.Body, req, opts, chatModelUID, responseFormat, reporter, out, auth)
+		// Peek at the first Connect frame: a content-policy refusal arrives as
+		// an EOS trailer with no data frames, so nothing was emitted yet and a
+		// trimmed retry is safe. Any data frame commits to the original stream.
+		trimmed := false
+		for {
+			flag, wire, errRead := helps.ReadConnectFrameWire(body)
+			if errRead != nil {
+				if errors.Is(errRead, io.EOF) || errors.Is(errRead, net.ErrClosed) || streamCtx.Err() != nil {
+					return
+				}
+				log.Warnf("devin executor: stream peek error: %v", errRead)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errRead}:
+				case <-streamCtx.Done():
+				}
+				return
+			}
+			if flag&helps.ConnectFlagEndStream == 0 {
+				body = io.MultiReader(bytes.NewReader(helps.WrapConnectEnvelopeWithFlag(flag, wire)), body)
+				break
+			}
+			code, errTrailer := helps.ParseDevinTrailerError(connectTrailerPayload(flag, wire))
+			if errTrailer != nil && code == http.StatusForbidden && strings.Contains(errTrailer.Error(), "permission_denied") && !trimmed && streamCtx.Err() == nil {
+				trimmed = true
+				_ = bodyCloser.Close()
+				bodyCloser = http.NoBody
+				if reqTrim, okTrim := trimDevinPolicyRetryRequest(req); okTrim {
+					log.Warnf("devin executor: permission_denied on full context, retrying with trimmed conversation")
+					httpReq2, chatModelUID2, logBody2, errPrep2 := e.prepareDevinHTTPRequest(streamCtx, auth, reqTrim, opts)
+					if errPrep2 == nil {
+						if chatModelUID2 != "" {
+							chatModelUID = chatModelUID2
+							reporter.SetUpstreamModel(chatModelUID2)
+						}
+						helps.RecordAPIRequest(streamCtx, e.cfg, helps.UpstreamRequestLog{
+							URL:       httpReq2.URL.String(),
+							Method:    http.MethodPost,
+							Headers:   httpReq2.Header.Clone(),
+							Body:      logBody2,
+							Provider:  e.Identifier(),
+							AuthID:    authID,
+							AuthLabel: authLabel,
+							AuthType:  authType,
+							AuthValue: authValue,
+						})
+						httpResp2, errDo2 := httpClient.Do(httpReq2)
+						if errDo2 == nil {
+							helps.RecordAPIResponseMetadata(streamCtx, e.cfg, httpResp2.StatusCode, httpResp2.Header.Clone())
+							if httpResp2.StatusCode >= 200 && httpResp2.StatusCode < 300 {
+								body = httpResp2.Body
+								bodyCloser = httpResp2.Body
+								continue
+							}
+							_, _ = io.Copy(io.Discard, io.LimitReader(httpResp2.Body, 1<<20))
+							_ = httpResp2.Body.Close()
+						}
+					}
+				}
+			}
+			// Terminal frame (error or clean EOS): replay it through the normal
+			// stream machinery so failure events and error chunks stay uniform.
+			body = bytes.NewReader(helps.WrapConnectEnvelopeWithFlag(flag, wire))
+			break
+		}
+
+		e.streamDevinFramesForAuth(streamCtx, body, req, opts, chatModelUID, responseFormat, reporter, out, auth)
 	}()
 
 	return &cliproxyexecutor.StreamResult{
@@ -2757,6 +2838,39 @@ func devinApplyPatchStatusError(diagnostic string) statusErr {
 // #6690) is credential-scoped and, when auth carries a valid observed reset
 // timestamp for that window, retries only after the reset. Transient
 // capacity and generic rate-limit 429s stay model-scoped.
+// trimDevinPolicyRetryRequest rebuilds a request whose payload keeps only the
+// system turns and the last user turn, for the content-policy retry. A
+// payload without a trim-able conversation returns false.
+func trimDevinPolicyRetryRequest(req cliproxyexecutor.Request) (cliproxyexecutor.Request, bool) {
+	trimmed, ok := helps.TrimDevinPayloadForPolicyRetry(req.Payload)
+	if !ok {
+		return cliproxyexecutor.Request{}, false
+	}
+	req.Payload = trimmed
+	return req, true
+}
+
+// connectTrailerPayload decodes a terminal Connect frame payload for trailer
+// inspection; undecodable frames pass the raw wire bytes through so the parse
+// fails and the frame is replayed unchanged.
+func connectTrailerPayload(flag byte, wire []byte) []byte {
+	decoded, err := helps.DecompressConnectFramePayload(flag, wire)
+	if err != nil {
+		return wire
+	}
+	return decoded
+}
+
+// isDevinPermissionDeniedErr reports a content-policy refusal from Devin,
+// which surfaces as a 403 carrying the upstream permission_denied code.
+func isDevinPermissionDeniedErr(err error) bool {
+	var status statusErr
+	if !errors.As(err, &status) {
+		return false
+	}
+	return status.code == http.StatusForbidden && strings.Contains(status.msg, "permission_denied")
+}
+
 func devinTrailerStatusError(code int, msg string, auth *cliproxyauth.Auth) statusErr {
 	return devinQuotaScopedStatusError(statusErr{code: code, msg: msg}, auth, time.Now())
 }
