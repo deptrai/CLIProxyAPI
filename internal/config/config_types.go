@@ -1125,8 +1125,29 @@ type OpenAICompatibility struct {
 	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
+	// Timeout bounds the wait for upstream response headers for this provider.
+	// A request that receives no response headers within this duration fails
+	// with a synthesized gateway-timeout error so routing can fail over to the
+	// next candidate instead of hanging until the client aborts. The deadline
+	// is disarmed once headers arrive, so streaming responses are unaffected.
+	// Examples: "30s", "1m30s". Unset or non-positive disables the timeout.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+
 	// RequestScopedErrors configures custom classification rules for upstream errors.
 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+}
+
+// TimeoutDuration parses Timeout into a time.Duration. Non-positive or
+// unparsable values disable the upstream header timeout.
+func (c *OpenAICompatibility) TimeoutDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(c.Timeout))
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

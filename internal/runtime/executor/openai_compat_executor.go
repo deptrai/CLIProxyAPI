@@ -218,7 +218,7 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doRequestWithHeaderTimeout(ctx, httpClient, httpReq, compat.TimeoutDuration())
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -322,7 +322,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doRequestWithHeaderTimeout(ctx, httpClient, httpReq, e.resolveCompatConfig(auth, req).TimeoutDuration())
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -466,7 +466,7 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	// Early role/empty frames are only first-packet fallbacks, not effective tokens.
 	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doRequestWithHeaderTimeout(ctx, httpClient, httpReq, compat.TimeoutDuration())
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
@@ -753,7 +753,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doRequestWithHeaderTimeout(ctx, httpClient, httpReq, e.resolveCompatConfig(auth, req).TimeoutDuration())
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
@@ -1273,6 +1273,66 @@ func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, b
 		status = http.StatusBadGateway
 	}
 	return statusErr{code: status, msg: string(payload)}, true
+}
+
+// doRequestWithHeaderTimeout issues an upstream request while optionally
+// bounding only the wait for response headers. Once headers arrive the timer
+// is disarmed so streaming bodies are unaffected. An expired header wait is
+// reported as a synthesized 504 so the conductor fails over to the next
+// candidate instead of hanging until the client aborts.
+func doRequestWithHeaderTimeout(ctx context.Context, client *http.Client, req *http.Request, timeout time.Duration) (*http.Response, error) {
+	if timeout <= 0 {
+		return client.Do(req)
+	}
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	timer := time.AfterFunc(timeout, cancelReq)
+	resp, err := client.Do(req.WithContext(reqCtx))
+	if err != nil {
+		timer.Stop()
+		cancelReq()
+		if ctx.Err() == nil && reqCtx.Err() != nil {
+			return nil, statusErr{
+				code:       http.StatusGatewayTimeout,
+				msg:        fmt.Sprintf("upstream response timeout after %s", timeout),
+				diagnostic: "openai compat upstream response timeout",
+			}
+		}
+		return nil, err
+	}
+	if !timer.Stop() {
+		// The deadline fired concurrently with a completed exchange; wait for
+		// the cancel to land, then treat a dead context as a header timeout.
+		select {
+		case <-reqCtx.Done():
+			if resp != nil && resp.Body != nil {
+				if errClose := resp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close response body error: %v", errClose)
+				}
+			}
+			cancelReq()
+			return nil, statusErr{
+				code:       http.StatusGatewayTimeout,
+				msg:        fmt.Sprintf("upstream response timeout after %s", timeout),
+				diagnostic: "openai compat upstream response timeout",
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	resp.Body = &cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancelReq}
+	return resp, nil
+}
+
+// cancelOnCloseReadCloser releases the request context once the response body
+// is closed so per-request cancel functions do not leak into the parent.
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseReadCloser) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 type statusErr struct {

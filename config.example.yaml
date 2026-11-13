@@ -971,6 +971,7 @@ upstream:
 #       support-prompt-cache-key: false # optional: derive prompt_cache_key for requests from all input protocols
 #       disable-cooling: false # optional provider override: true disables cooling, false enables it; omit to inherit global
 #       request-retry: 3 # optional per-provider override; 0 disables additional rounds; omit or set < 0 to inherit global
+#       timeout: 30s # optional: max wait for upstream response headers; on expiry the attempt fails over to the next candidate instead of hanging. Unset disables.
 #       request-scoped-errors: # optional: custom rules to classify upstream errors by status and body patterns
 #         - status: 400
 #           match:
