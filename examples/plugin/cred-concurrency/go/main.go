@@ -69,11 +69,14 @@ var inflight = struct {
 	// prefix caches live on the serving account, so spreading one conversation
 	// across accounts throws the cached prefix away on every hop.
 	bindings map[string]affinityBinding
+	// breakers holds the per-auth slow-breaker state for slow_breakers rules.
+	breakers map[string]*breakerState
 }{
 	slots:      make(map[string][]time.Time),
 	lastPicked: make(map[string]string),
 	swept:      make(map[string]int),
 	bindings:   make(map[string]affinityBinding),
+	breakers:   make(map[string]*breakerState),
 }
 
 // affinityBinding is one session-to-credential pin with the time it was made.
@@ -125,11 +128,69 @@ type pluginConfig struct {
 	// Zero or empty keeps the fail-fast behavior.
 	WaitTimeout string `yaml:"wait_timeout"`
 
+	// ModelLimits optionally caps concurrency per model group. All models in one
+	// group share a single slot bucket per auth, so several upstream variants
+	// (e.g. swe-2-flash medium/high) drain one budget. A matching rule overrides
+	// the auth's base limit for that request. Model patterns are case-insensitive
+	// and support a single trailing "*" for prefix matches.
+	ModelLimits []modelLimitRule `yaml:"model_limits"`
+
+	// SlowBreakers optionally trips a per-auth circuit breaker when an upstream
+	// gets slow: min_samples consecutive completions over threshold_ms close the
+	// auth for open_seconds, while one probe request leaks through every
+	// probe_seconds — a fast probe reopens the auth early. Metric is TTFT when
+	// recorded, else total request latency; failed requests always count slow.
+	SlowBreakers []slowBreakerRule `yaml:"slow_breakers"`
+
 	slotTTL     time.Duration
 	rrProviders map[string]bool
 	affinityTTL time.Duration
 	waitTimeout time.Duration
 }
+
+type modelLimitRule struct {
+	// Key names the shared slot bucket; models in the same group share it.
+	Key string `yaml:"key"`
+	// Limit is the max concurrent requests per auth for this group.
+	Limit int64 `yaml:"limit"`
+	// Providers optionally scopes the rule to candidates of these providers.
+	Providers []string `yaml:"providers"`
+	// Models lists requested-model patterns; trailing "*" means prefix match.
+	Models []string `yaml:"models"`
+}
+
+// slowBreakerRule configures a per-auth latency circuit breaker.
+type slowBreakerRule struct {
+	// Providers scopes the rule to these provider names (case-insensitive
+	// match on the candidate's / usage record's Provider).
+	Providers []string `yaml:"providers"`
+	// ThresholdMs is the latency in ms above which a completion counts as
+	// slow. TTFT is used when recorded, else total request latency.
+	ThresholdMs int64 `yaml:"threshold_ms"`
+	// MinSamples is how many consecutive slow completions trip the breaker
+	// (default 3).
+	MinSamples int `yaml:"min_samples"`
+	// OpenSeconds is how long the breaker stays open (default 300).
+	OpenSeconds int64 `yaml:"open_seconds"`
+	// ProbeSeconds is the minimum interval between probe requests while the
+	// breaker is open (default 60).
+	ProbeSeconds int64 `yaml:"probe_seconds"`
+}
+
+// breakerState is the per-auth slow-breaker state: consecutive slow samples
+// while closed, and while open the probe bookkeeping (only one probe leaks
+// through every probe_seconds; a fast probe closes the breaker early).
+type breakerState struct {
+	slow           int
+	openUntil      time.Time
+	probeAt        time.Time
+	probing        bool
+	probeGrantedAt time.Time
+}
+
+// probeStaleTTL is how long a granted probe may go without a usage record
+// before a fresh probe is allowed again (e.g. client disconnect).
+const probeStaleTTL = 2 * time.Minute
 
 type registration struct {
 	SchemaVersion uint32                 `json:"schema_version"`
@@ -278,7 +339,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "cred-concurrency",
-			Version:          "0.1.0",
+			Version:          "0.2.0",
 			Author:           "deptrai",
 			GitHubRepository: "https://github.com/deptrai/CLIProxyAPI",
 			ConfigFields: []pluginapi.ConfigField{
@@ -307,6 +368,16 @@ func pluginRegistration() registration {
 					Type:        pluginapi.ConfigFieldTypeString,
 					Description: "How long a session-to-credential pin survives without a fresh pick (default 1h).",
 				},
+				{
+					Name:        "model_limits",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Optional per-model-group concurrency caps: [{key, limit, providers?, models}]. Models in one group share a single slot bucket per auth; trailing \"*\" in a pattern is a prefix match.",
+				},
+				{
+					Name:        "slow_breakers",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Optional per-auth latency circuit breakers: [{providers, threshold_ms, min_samples?, open_seconds?, probe_seconds?}]. min_samples consecutive slow completions (TTFT, else latency; failures count) close the auth for open_seconds; one probe leaks through every probe_seconds and a fast probe reopens early.",
+				},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -317,27 +388,196 @@ func pluginRegistration() registration {
 	}
 }
 
-// limitFor resolves the concurrency cap for a candidate: config override first,
-// then the credential's max_concurrent metadata/attribute. 0 means unlimited.
-func limitFor(cfg pluginConfig, candidate pluginapi.SchedulerAuthCandidate) int64 {
+// matchModelPattern reports whether model matches pattern; a trailing "*" is a
+// case-insensitive prefix wildcard, anything else is an exact match.
+func matchModelPattern(pattern, model string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return false
+	}
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(strings.ToLower(model), strings.ToLower(pattern[:len(pattern)-1]))
+	}
+	return strings.EqualFold(pattern, model)
+}
+
+// matchModelLimit returns the first model_limits rule applying to this
+// candidate + model pair, or nil. Rule providers empty means all providers.
+func matchModelLimit(cfg pluginConfig, candidate pluginapi.SchedulerAuthCandidate, model string) *modelLimitRule {
+	for i := range cfg.ModelLimits {
+		rule := &cfg.ModelLimits[i]
+		// Rules with a non-positive limit place no stamps anywhere: matching
+		// them at release time would point the pop at a bucket that never
+		// exists while pick stored under the auth-limit bucket.
+		if rule.Limit <= 0 {
+			continue
+		}
+		if len(rule.Providers) > 0 {
+			matched := false
+			for _, provider := range rule.Providers {
+				if strings.EqualFold(strings.TrimSpace(provider), strings.TrimSpace(candidate.Provider)) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		for _, pattern := range rule.Models {
+			if matchModelPattern(pattern, model) {
+				return rule
+			}
+		}
+	}
+	return nil
+}
+
+// limitFor resolves the concurrency cap for a candidate: a matching
+// model_limits rule wins first (its group key becomes the slot bucket), then
+// the per-auth config override, then the credential's max_concurrent
+// metadata/attribute. 0 means unlimited. The returned bucket scopes the slot
+// count: "" = per-auth bucket (legacy behavior), otherwise "<rule key>".
+func limitFor(cfg pluginConfig, candidate pluginapi.SchedulerAuthCandidate, model string) (int64, string) {
+	if rule := matchModelLimit(cfg, candidate, model); rule != nil && rule.Limit > 0 {
+		return rule.Limit, rule.Key
+	}
 	if cfg.Limits != nil {
 		if limit, ok := cfg.Limits[candidate.ID]; ok {
-			return limit
+			return limit, ""
 		}
 	}
 	for _, key := range []string{"max_concurrent", "max-concurrent"} {
 		if value, ok := candidate.Metadata[key]; ok {
 			if limit, ok := metadataLimit(value); ok {
-				return limit
+				return limit, ""
 			}
 		}
 		if raw := strings.TrimSpace(candidate.Attributes[key]); raw != "" {
 			if limit, errParse := strconv.ParseInt(raw, 10, 64); errParse == nil {
-				return max(limit, 0)
+				return max(limit, 0), ""
 			}
 		}
 	}
-	return 0
+	return 0, ""
+}
+
+// matchSlowBreaker returns the first slow_breakers rule covering provider, or
+// nil. Provider matching is case-insensitive.
+func matchSlowBreaker(cfg pluginConfig, provider string) *slowBreakerRule {
+	want := strings.ToLower(strings.TrimSpace(provider))
+	if want == "" {
+		return nil
+	}
+	for i := range cfg.SlowBreakers {
+		rule := &cfg.SlowBreakers[i]
+		if rule.ThresholdMs <= 0 {
+			continue
+		}
+		for _, p := range rule.Providers {
+			if strings.ToLower(strings.TrimSpace(p)) == want {
+				return rule
+			}
+		}
+	}
+	return nil
+}
+
+// breakerAllows reports whether the candidate may be picked while its slow
+// breaker is open. The first pick after probe_seconds marks the auth as
+// probing; concurrent probes are refused. Callers must hold inflight.Lock.
+func breakerAllows(rule *slowBreakerRule, authID string, now time.Time) bool {
+	if rule == nil {
+		return true
+	}
+	st := inflight.breakers[authID]
+	if st == nil || !st.openUntil.After(now) {
+		return true
+	}
+	if now.Before(st.probeAt) {
+		return false
+	}
+	if st.probing && now.Sub(st.probeGrantedAt) < probeStaleTTL {
+		return false
+	}
+	st.probing = true
+	st.probeGrantedAt = now
+	st.probeAt = now.Add(breakerProbeInterval(rule))
+	return true
+}
+
+// recordBreakerSample folds a completed request's latency into the breaker
+// state. Metric: TTFT when recorded, else total request latency. Failures
+// always count as slow. Callers must hold inflight.Lock.
+func recordBreakerSample(cfg pluginConfig, record pluginapi.UsageRecord, now time.Time) {
+	rule := matchSlowBreaker(cfg, record.Provider)
+	if rule == nil || record.AuthID == "" {
+		return
+	}
+	st := inflight.breakers[record.AuthID]
+	if st == nil {
+		st = &breakerState{}
+		inflight.breakers[record.AuthID] = st
+	}
+	dur := record.TTFT
+	if dur <= 0 {
+		dur = record.Latency
+	}
+	slow := record.Failed || dur.Milliseconds() > rule.ThresholdMs
+	if st.openUntil.After(now) {
+		// Open: only the probe result counts. A completion that started before
+		// the probe was granted is an in-flight leftover and must not be read as
+		// the probe — a fast leftover would otherwise close a still-slow breaker.
+		if st.probing && isProbeCompletion(record, st, now) {
+			st.probing = false
+			if slow {
+				st.probeAt = now.Add(breakerProbeInterval(rule))
+			} else {
+				st.openUntil = time.Time{}
+				st.slow = 0
+			}
+		}
+		return
+	}
+	if !slow {
+		st.slow = 0
+		return
+	}
+	st.slow++
+	minSamples := rule.MinSamples
+	if minSamples < 1 {
+		minSamples = 3
+	}
+	if st.slow >= minSamples {
+		openSeconds := rule.OpenSeconds
+		if openSeconds < 1 {
+			openSeconds = 300
+		}
+		st.openUntil = now.Add(time.Duration(openSeconds) * time.Second)
+		st.probeAt = now.Add(breakerProbeInterval(rule))
+		st.slow = 0
+	}
+}
+
+// isProbeCompletion reports whether a usage record belongs to the granted
+// probe rather than a request that was already in flight when the probe
+// started: the request's approximate start (completion minus total latency)
+// must be at/after the grant. Callers must hold inflight.Lock.
+func isProbeCompletion(record pluginapi.UsageRecord, st *breakerState, now time.Time) bool {
+	dur := record.Latency
+	if dur <= 0 {
+		dur = record.TTFT
+	}
+	startedAt := now.Add(-dur)
+	return !startedAt.Before(st.probeGrantedAt.Add(-1 * time.Second))
+}
+
+// breakerProbeInterval returns the probe spacing with its default applied.
+func breakerProbeInterval(rule *slowBreakerRule) time.Duration {
+	if rule.ProbeSeconds > 0 {
+		return time.Duration(rule.ProbeSeconds) * time.Second
+	}
+	return 60 * time.Second
 }
 
 // metadataLimit normalizes numeric metadata values (JSON decodes to float64).
@@ -448,17 +688,45 @@ func sweepBindings(now time.Time, ttl time.Duration) {
 	}
 }
 
-func acquireSlot(candidate pluginapi.SchedulerAuthCandidate, limit int64, rotKey string, now time.Time) bool {
+// slotKey scopes the inflight bucket: model-limit groups get their own bucket
+// per auth so e.g. swe-2(max) and swe-2-flash don't share a cap. The bucket is
+// separated by a byte that can never appear in auth IDs or group keys.
+func slotKey(authID, bucket string) string {
+	if bucket == "" {
+		return authID
+	}
+	return authID + "\x1f" + bucket
+}
+
+func acquireSlot(candidate pluginapi.SchedulerAuthCandidate, limit int64, bucket, rotKey string, now time.Time) bool {
 	if limit > 0 {
-		if int64(len(inflight.slots[candidate.ID])) >= limit {
+		key := slotKey(candidate.ID, bucket)
+		if int64(len(inflight.slots[key])) >= limit {
 			return false
 		}
-		inflight.slots[candidate.ID] = append(inflight.slots[candidate.ID], now)
+		inflight.slots[key] = append(inflight.slots[key], now)
 	}
 	if inflight.lastPicked != nil && rotKey != "" {
 		inflight.lastPicked[rotKey] = candidate.ID
 	}
 	return true
+}
+
+// undoAcquireSlot removes the stamp a just-succeeded acquireSlot appended for
+// now when a later gate (e.g. the slow breaker) rejects the candidate — without
+// it the breaker probe is burned while no request ever runs. Callers must hold
+// inflight.Lock.
+func undoAcquireSlot(candidate pluginapi.SchedulerAuthCandidate, bucket string, now time.Time) {
+	key := slotKey(candidate.ID, bucket)
+	stamps := inflight.slots[key]
+	if n := len(stamps); n > 0 && stamps[n-1].Equal(now) {
+		stamps = stamps[:n-1]
+		if len(stamps) == 0 {
+			delete(inflight.slots, key)
+		} else {
+			inflight.slots[key] = stamps
+		}
+	}
 }
 
 func tierRotationKey(candidate pluginapi.SchedulerAuthCandidate) string {
@@ -505,10 +773,13 @@ func pickAuthAttempt(raw []byte) (pluginapi.SchedulerPickResponse, error) {
 	}
 	cfg := loadedConfig()
 
-	// Fast path: no limited candidate at all -> let the builtin scheduler run.
-	hasLimited := false
+	// Fast path: no limited or breaker-scoped candidate at all -> let the
+	// builtin scheduler run. Session affinity alone still needs the plugin
+	// (it owns the pin store), so it engages the scheduler even with no caps.
+	hasLimited := cfg.SessionAffinity
 	for _, candidate := range req.Candidates {
-		if limitFor(cfg, candidate) > 0 {
+		limit, _ := limitFor(cfg, candidate, req.Model)
+		if limit > 0 || matchSlowBreaker(cfg, candidate.Provider) != nil {
 			hasLimited = true
 			break
 		}
@@ -543,8 +814,14 @@ func pickAuthAttempt(raw []byte) (pluginapi.SchedulerPickResponse, error) {
 					}
 					// Busy is transient: fail over for this request but keep the
 					// pin so the session returns once the slot frees.
-					if acquireSlot(candidate, limitFor(cfg, candidate), tierRotationKey(candidate), now) {
-						return pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true}, nil
+					pinLimit, pinBucket := limitFor(cfg, candidate, req.Model)
+					// Acquire before the breaker check: a breaker reject without a
+					// slot acquire would burn the probe with no request ever sent.
+					if acquireSlot(candidate, pinLimit, pinBucket, tierRotationKey(candidate), now) {
+						if breakerAllows(matchSlowBreaker(cfg, candidate.Provider), candidate.ID, now) {
+							return pluginapi.SchedulerPickResponse{AuthID: candidate.ID, Handled: true}, nil
+						}
+						undoAcquireSlot(candidate, pinBucket, now)
 					}
 					pinnedBusy = true
 					break
@@ -600,7 +877,15 @@ func pickAuthAttempt(raw []byte) (pluginapi.SchedulerPickResponse, error) {
 
 		for i := 0; i < m; i++ {
 			candidate := tier.candidates[(startIdx+i)%m]
-			if !acquireSlot(candidate, limitFor(cfg, candidate), rotKey, now) {
+			limit, bucket := limitFor(cfg, candidate, req.Model)
+			// Acquire before the breaker check so a breaker reject can undo the
+			// stamp; checking the breaker first would burn its probe grant while
+			// no request is actually in flight (slot-full case).
+			if !acquireSlot(candidate, limit, bucket, rotKey, now) {
+				continue
+			}
+			if !breakerAllows(matchSlowBreaker(cfg, candidate.Provider), candidate.ID, now) {
+				undoAcquireSlot(candidate, bucket, now)
 				continue
 			}
 			// Never move an existing pin to another credential: a dead primary
@@ -639,26 +924,72 @@ func releaseSlot(raw []byte) ([]byte, error) {
 	if authID == "" {
 		return okEnvelope(struct{}{})
 	}
+	// Keep the resolved ID on the record so downstream consumers (breaker
+	// samples) see it even when the wire used snake_case.
+	record.AuthID = authID
+	// The slot bucket must match the one chosen at pick time: model-limit rules
+	// scope by candidate provider + requested model. The usage record carries
+	// the provider; the requested model may sit in Alias when the upstream name
+	// was remapped, so try Alias first then Model.
+	bucket := ""
+	if cfg := loadedConfig(); len(cfg.ModelLimits) > 0 {
+		candidate := pluginapi.SchedulerAuthCandidate{Provider: record.Provider}
+		model := record.Alias
+		if model == "" {
+			model = record.Model
+		}
+		if rule := matchModelLimit(cfg, candidate, model); rule != nil {
+			bucket = rule.Key
+		} else if model != record.Model {
+			if rule = matchModelLimit(cfg, candidate, record.Model); rule != nil {
+				bucket = rule.Key
+			}
+		}
+	}
+	key := slotKey(authID, bucket)
 	inflight.Lock()
 	defer inflight.Unlock()
-	stamps := inflight.slots[authID]
+	recordBreakerSample(loadedConfig(), record, time.Now())
+	stamps := inflight.slots[key]
+	if len(stamps) == 0 {
+		// The pick-time bucket can fail to recompute here (the record carries
+		// the upstream model name, the alias is empty, or rules changed since
+		// the pick): fall back to the oldest live stamp under this auth so a
+		// real release still frees a slot instead of leaking until slot_ttl.
+		fallbackKey := ""
+		var fallbackAt time.Time
+		for otherKey, otherStamps := range inflight.slots {
+			if len(otherStamps) == 0 || otherKey == key {
+				continue
+			}
+			if otherKey != authID && !strings.HasPrefix(otherKey, authID+"\x1f") {
+				continue
+			}
+			if fallbackKey == "" || otherStamps[0].Before(fallbackAt) {
+				fallbackKey, fallbackAt = otherKey, otherStamps[0]
+			}
+		}
+		if fallbackKey != "" {
+			key, stamps = fallbackKey, inflight.slots[fallbackKey]
+		}
+	}
 	if len(stamps) > 0 {
 		// Live stamps release first: a record almost always belongs to a live
 		// pick. A swept slot's record rarely arrives later (requests do not
 		// outlive the TTL by much), and eating live records while swept credit
 		// exists strands every future stamp behind the TTL.
 		if len(stamps) == 1 {
-			delete(inflight.slots, authID)
+			delete(inflight.slots, key)
 		} else {
-			inflight.slots[authID] = stamps[1:]
+			inflight.slots[key] = stamps[1:]
 		}
 		return okEnvelope(struct{}{})
 	}
 	// No live stamps: the record belongs to a slot already reclaimed as a leak.
-	if inflight.swept[authID] > 0 {
-		inflight.swept[authID]--
-		if inflight.swept[authID] <= 0 {
-			delete(inflight.swept, authID)
+	if inflight.swept[key] > 0 {
+		inflight.swept[key]--
+		if inflight.swept[key] <= 0 {
+			delete(inflight.swept, key)
 		}
 	}
 	return okEnvelope(struct{}{})

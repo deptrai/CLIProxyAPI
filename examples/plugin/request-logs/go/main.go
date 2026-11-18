@@ -35,6 +35,7 @@ import "C"
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -42,6 +43,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -961,7 +963,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 			Headers:    map[string][]string{"Content-Type": {"text/html; charset=utf-8"}},
 			Body:       []byte(pageHTML),
 		})
-	case strings.HasSuffix(path, "/request-logs/entries"):
+	case strings.Contains(path, "/request-logs/entries"):
 		if method != "" && method != http.MethodGet && method != http.MethodHead {
 			return okEnvelope(managementResponseWire{
 				StatusCode: http.StatusMethodNotAllowed,
@@ -969,7 +971,20 @@ func handleManagement(raw []byte) ([]byte, error) {
 				Body:       []byte(`{"error":"method not allowed"}`),
 			})
 		}
-		return entriesJSON()
+		limit := 0
+		if q := req.Query["limit"]; len(q) > 0 {
+			if n, err := strconv.Atoi(strings.TrimSpace(q[0])); err == nil {
+				limit = n
+			}
+		}
+		wantGzip := false
+		for _, h := range req.Headers["Accept-Encoding"] {
+			if strings.Contains(strings.ToLower(h), "gzip") {
+				wantGzip = true
+				break
+			}
+		}
+		return entriesJSON(limit, wantGzip)
 	case strings.HasSuffix(path, "/request-logs/clear"):
 		if method != http.MethodPost {
 			return okEnvelope(managementResponseWire{
@@ -997,7 +1012,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 }
 
-func entriesJSON() ([]byte, error) {
+func entriesJSON(limit int, wantGzip bool) ([]byte, error) {
 	entries := entriesSnapshot()
 	stats := map[string]int{"total": len(entries)}
 	providers := map[string]struct{}{}
@@ -1032,10 +1047,15 @@ func entriesJSON() ([]byte, error) {
 			apiKeys[e.APIKey] = struct{}{}
 		}
 	}
+	out := entries
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
 	providerList := keysOf(providers)
 	modelList := keysOf(models)
 	payload, err := json.Marshal(map[string]any{
-		"entries":             entries,
+		"entries":             out,
+		"entries_total":       len(entries),
 		"stats":               stats,
 		"providers":           providerList,
 		"models":              modelList,
@@ -1047,9 +1067,22 @@ func entriesJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	headers := map[string][]string{"Content-Type": {"application/json"}}
+	if wantGzip {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(payload); err != nil {
+			return nil, err
+		}
+		if err := zw.Close(); err != nil {
+			return nil, err
+		}
+		payload = buf.Bytes()
+		headers["Content-Encoding"] = []string{"gzip"}
+	}
 	return okEnvelope(managementResponseWire{
 		StatusCode: http.StatusOK,
-		Headers:    map[string][]string{"Content-Type": {"application/json"}},
+		Headers:    headers,
 		Body:       payload,
 	})
 }
@@ -1235,7 +1268,7 @@ tr.err td{background:#1c1216}
 </tr></thead><tbody id="tb"></tbody></table></div>
 <div class="empty" id="empty" style="display:none">No requests logged yet.</div>
 <script>
-let rows=[], live=true, openId=null, KEY=localStorage.getItem('cpa-rl-key')||'';
+let rows=[], live=true, openId=null, inflight=false, KEY=localStorage.getItem('cpa-rl-key')||localStorage.getItem('managementKey')||'';
 const COLS=[['status','Status'],['model','Model'],['requested','Requested'],['provider','Provider'],['account','Account'],['apikey','API Key'],['tokens','Tokens'],['tps','TPS'],['ttft','TTFT'],['duration','Duration'],['stream','Stream'],['time','Time'],['trace','Trace'],['prompt','Prompt']];
 let hiddenCols=new Set(JSON.parse(localStorage.getItem('cpa-rl-cols')||'[]'));
 function applyCols(){document.getElementById('colstyle').textContent=[...hiddenCols].map(k=>'.c-'+k+'{display:none}').join('');}
@@ -1254,7 +1287,7 @@ function renderCtlPanel(){
  CTLS.forEach(([k,lab])=>{const lb=document.createElement('label');const cb=document.createElement('input');cb.type='checkbox';cb.checked=!hiddenCtls.has(k);cb.onchange=()=>{if(cb.checked)hiddenCtls.delete(k);else hiddenCtls.add(k);localStorage.setItem('cpa-rl-ctls',JSON.stringify([...hiddenCtls]));applyCtls()};lb.appendChild(cb);lb.appendChild(document.createTextNode(lab));l.appendChild(lb)});
 }
 applyCtls();
-const DATA='/v0/management/request-logs/entries';
+const DATA='/v0/management/request-logs/entries?limit=500';
 const CLEAR='/v0/management/request-logs/clear';
 if(KEY)document.getElementById('auth').style.display='none';
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -1270,10 +1303,11 @@ function stLabel(e){
 }
 function fill(sel,list){const el=document.getElementById(sel);const cur=el.value;while(el.options.length>1)el.remove(1);list.forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;el.appendChild(o)});el.value=cur}
 async function fetchData(){
- if(!KEY)return; // never probe the endpoint without a key: the host bans repeated failures
+ if(!KEY||inflight)return; inflight=true; // never probe the endpoint without a key: the host bans repeated failures
+ let retry=false;
  try{
   const r=await fetch(DATA,{headers:{'Authorization':'Bearer '+KEY,'X-Management-Key':KEY}});
-  if(r.status===401||r.status===403){live=false;document.getElementById('liveBtn').textContent='▶ Resume';document.getElementById('livedot').className='dot';document.getElementById('auth').style.display='flex';document.getElementById('authmsg').textContent='Key rejected — enter a valid management key';return}
+  if(r.status===401||r.status===403){const mk=localStorage.getItem('managementKey');if(mk&&mk!==KEY){KEY=mk;localStorage.setItem('cpa-rl-key',KEY);retry=true;return}live=false;document.getElementById('liveBtn').textContent='▶ Resume';document.getElementById('livedot').className='dot';document.getElementById('auth').style.display='flex';document.getElementById('authmsg').textContent='Key rejected — enter a valid management key';return}
   document.getElementById('auth').style.display='none';
   const d=await r.json();rows=d.entries||[];
   document.getElementById('cTotal').textContent=d.stats.total||0;
@@ -1284,7 +1318,7 @@ async function fetchData(){
   for(const[p,n]of Object.entries(d.running_by_provider||{})){const c=document.createElement('span');c.className='chip run';c.innerHTML='⟳ '+esc(p)+' <b>'+n+'</b>';rp.appendChild(c)}
   fill('fProv',d.providers||[]);fill('fModel',d.models||[]);fill('fAcct',d.accounts||[]);fill('fKey',d.api_keys||[]);
   render();
- }catch(e){/*keep old rows*/}
+ }catch(e){/*keep old rows*/}finally{inflight=false;if(retry)fetchData()}
 }
 function saveKey(){KEY=document.getElementById('key').value.trim();localStorage.setItem('cpa-rl-key',KEY);live=true;document.getElementById('liveBtn').textContent='⏸ Pause';document.getElementById('livedot').className='dot on';fetchData();}
 function showErrors(){const s=document.getElementById('fStatus');s.value=s.value==='err'?'':'err';render();}

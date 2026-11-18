@@ -1,4 +1,4 @@
-EXAMPLES := simple model auth frontend-auth executor protocol-format request-translator request-normalizer response-translator response-normalizer thinking usage cli management-api host-callback host-callback-auth-files host-model-callback claude-web-search-router request-logs cred-concurrency
+EXAMPLES := simple model auth frontend-auth executor protocol-format request-translator request-normalizer response-translator response-normalizer thinking usage cli management-api host-callback host-callback-auth-files host-model-callback claude-web-search-router request-logs cred-concurrency tool-loop-guard
 LANGUAGES := go c rust
 BIN_DIR := $(CURDIR)/bin
 BUILD_DIR := $(BIN_DIR)/build
@@ -29,10 +29,14 @@ endif
 
 .PHONY: build list clean
 
-build: $(foreach example,$(EXAMPLES),$(foreach lang,$(LANGUAGES),$(BIN_DIR)/$(example)-$(lang).$(PLUGIN_EXT)))
+# Only advertise the language implementations that actually exist per example
+# — go-only examples must not emit c/rust targets that cannot build.
+AVAILABLE := $(foreach example,$(EXAMPLES),$(foreach lang,$(LANGUAGES),$(if $(wildcard $(example)/$(lang)),$(example):$(lang),)))
+
+build: $(foreach pair,$(AVAILABLE),$(BIN_DIR)/$(subst :,-,$(pair)).$(PLUGIN_EXT))
 
 list:
-	@$(foreach example,$(EXAMPLES),$(foreach lang,$(LANGUAGES),echo $(example)/$(lang);))
+	@$(foreach pair,$(AVAILABLE),echo $(subst :,/,$(pair));)
 
 clean:
 	rm -rf $(BIN_DIR)

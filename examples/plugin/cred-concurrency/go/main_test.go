@@ -659,7 +659,7 @@ func TestLimitForResolutionOrder(t *testing.T) {
 		{name: "unlimited when absent", candidate: pluginapi.SchedulerAuthCandidate{ID: "f"}, want: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := limitFor(cfg, tc.candidate); got != tc.want {
+			if got, _ := limitFor(cfg, tc.candidate, "any-model"); got != tc.want {
 				t.Fatalf("limitFor() = %d, want %d", got, tc.want)
 			}
 		})
@@ -888,5 +888,173 @@ func TestPickFailFastWithoutWaitTimeout(t *testing.T) {
 	}
 	if elapsed >= 200*time.Millisecond {
 		t.Fatalf("fail-fast pick took %v, expected no retry sleep", elapsed)
+	}
+}
+
+// pickModel runs scheduler.pick for a specific requested model.
+func pickModel(t *testing.T, model, candidates string) pluginapiPickResponse {
+	t.Helper()
+	raw, err := handleMethod("scheduler.pick", []byte(`{"provider":"devin","model":"`+model+`","candidates":`+candidates+`}`))
+	if err != nil {
+		t.Fatalf("pickAuth error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("pick not ok: %s", raw)
+	}
+	var resp pluginapiPickResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	return resp
+}
+
+// TestModelLimitsScopedBuckets verifies model_limits buckets are independent:
+// a full swe2-max bucket must not block swe2-flash, and releasing a scoped
+// slot frees only that group.
+func TestModelLimitsScopedBuckets(t *testing.T) {
+	currentConfig.Store(pluginConfig{
+		slotTTL: 30 * time.Minute,
+		ModelLimits: []modelLimitRule{
+			{Key: "swe2-max", Limit: 1, Providers: []string{"devin"}, Models: []string{"claude-opus-5", "devin/swe-2*"}},
+			{Key: "swe2-flash", Limit: 3, Providers: []string{"devin"}, Models: []string{"claude-sonnet-5*", "claude-haiku-*", "devin/swe-2-flash*"}},
+		},
+	})
+	t.Cleanup(func() { currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute}) })
+	resetInflight(t)
+
+	single := `[{"ID":"dev1","Provider":"devin","Priority":20}]`
+
+	// First opus takes the only swe2-max slot; a second opus must reject.
+	if r := pickModel(t, "claude-opus-5", single); r.AuthID != "dev1" || !r.Handled {
+		t.Fatalf("opus pick = %+v, want dev1", r)
+	}
+	if r := pickModel(t, "claude-opus-5", single); !r.Reject {
+		t.Fatalf("second opus pick = %+v, want reject (bucket full)", r)
+	}
+
+	// swe2-flash bucket is separate: sonnet still picks dev1, up to 3 slots.
+	for i := 0; i < 3; i++ {
+		if r := pickModel(t, "claude-sonnet-5", single); r.AuthID != "dev1" || !r.Handled {
+			t.Fatalf("sonnet pick %d = %+v, want dev1", i, r)
+		}
+	}
+	if r := pickModel(t, "claude-haiku-4.5", single); !r.Reject {
+		t.Fatalf("fourth flash pick = %+v, want reject (flash bucket shares cap)", r)
+	}
+
+	// Releasing one flash slot frees the flash bucket only, max stays full.
+	raw, err := handleMethod("usage.handle", []byte(`{"request_id":"r","auth_id":"dev1","provider":"devin","model":"devin/swe-2-flash(high)","alias":"claude-sonnet-5"}`))
+	if err != nil {
+		t.Fatalf("usage error: %v", err)
+	}
+	if r := pickModel(t, "claude-sonnet-5", single); r.AuthID != "dev1" {
+		t.Fatalf("sonnet pick after release = %+v, want dev1", r)
+	}
+	if r := pickModel(t, "claude-opus-5", single); !r.Reject {
+		t.Fatalf("opus pick after flash release = %+v, want reject", r)
+	}
+	_ = raw
+}
+
+// usageRecord sends a usage record with latency details via the wire path.
+func usageRecord(t *testing.T, authID, provider string, ttft time.Duration, failed bool) {
+	t.Helper()
+	rec := map[string]any{
+		"request_id": "r", "auth_id": authID, "Provider": provider,
+		"TTFT": int64(ttft), "Failed": failed,
+	}
+	raw, errMarshal := json.Marshal(rec)
+	if errMarshal != nil {
+		t.Fatalf("marshal: %v", errMarshal)
+	}
+	out, err := handleMethod("usage.handle", raw)
+	if err != nil {
+		t.Fatalf("usage error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil || !env.OK {
+		t.Fatalf("usage not ok: %s", out)
+	}
+}
+
+// TestSlowBreakerSkipsAuthAfterSlowSamples trips the breaker with consecutive
+// slow completions and verifies picks fall through to the next provider.
+func TestSlowBreakerSkipsAuthAfterSlowSamples(t *testing.T) {
+	resetInflight(t)
+	defer func() { inflight.breakers = map[string]*breakerState{} }()
+	currentConfig.Store(pluginConfig{
+		slotTTL: 30 * time.Minute,
+		Limits:  map[string]int64{"vib1": 10, "dev1": 10},
+		SlowBreakers: []slowBreakerRule{{
+			Providers: []string{"vibe"}, ThresholdMs: 1000,
+			MinSamples: 2, OpenSeconds: 300, ProbeSeconds: 60,
+		}},
+	})
+	defer func() { currentConfig.Store(pluginConfig{slotTTL: 30 * time.Minute}) }()
+
+	candidates := `[
+		{"ID":"vib1","Provider":"vibe","Priority":24},
+		{"ID":"dev1","Provider":"devin","Priority":2}
+	]`
+	if r := pick(t, candidates); r.AuthID != "vib1" || !r.Handled {
+		t.Fatalf("first pick = %+v, want vib1", r)
+	}
+	// Two consecutive slow completions trip the breaker.
+	usageRecord(t, "vib1", "vibe", 2*time.Second, false)
+	usageRecord(t, "vib1", "vibe", 0, true) // a failure also counts as slow
+	if r := pick(t, candidates); r.AuthID != "dev1" {
+		t.Fatalf("pick with open breaker = %+v, want dev1 fallback", r)
+	}
+}
+
+// TestBreakerProbeLifecycle exercises the open/probe/close transitions with a
+// controlled clock.
+func TestBreakerProbeLifecycle(t *testing.T) {
+	defer func() { inflight.breakers = map[string]*breakerState{} }()
+	cfg := pluginConfig{SlowBreakers: []slowBreakerRule{{
+		Providers: []string{"vibe"}, ThresholdMs: 100,
+		MinSamples: 2, OpenSeconds: 300, ProbeSeconds: 10,
+	}}}
+	now := time.Now()
+	// feed(ttft, latency, at): Latency back-dates the request's start time so
+	// isProbeCompletion can attribute records to the granted probe.
+	feed := func(ttft, latency time.Duration, at time.Time) {
+		inflight.Lock()
+		recordBreakerSample(cfg, pluginapi.UsageRecord{
+			AuthID: "vib1", Provider: "vibe", TTFT: ttft, Latency: latency,
+		}, at)
+		inflight.Unlock()
+	}
+	allow := func(at time.Time) bool {
+		inflight.Lock()
+		defer inflight.Unlock()
+		return breakerAllows(matchSlowBreaker(cfg, "vibe"), "vib1", at)
+	}
+
+	feed(200*time.Millisecond, 200*time.Millisecond, now)
+	feed(300*time.Millisecond, 300*time.Millisecond, now)
+	if allow(now) {
+		t.Fatal("breaker should be open after 2 slow samples")
+	}
+	if !allow(now.Add(11 * time.Second)) {
+		t.Fatal("probe should be allowed after probe_seconds")
+	}
+	if allow(now.Add(12 * time.Second)) {
+		t.Fatal("concurrent probe must be refused while one is in flight")
+	}
+	// Slow probe -> breaker stays open, next probe re-armed. Latency=1s so the
+	// completion is attributed to the probe granted at +11s (started at +12s).
+	feed(5*time.Second, 1*time.Second, now.Add(13*time.Second))
+	if allow(now.Add(20 * time.Second)) {
+		t.Fatal("probeAt should have been re-armed to +23s")
+	}
+	if !allow(now.Add(24 * time.Second)) {
+		t.Fatal("next probe window should open after re-arm")
+	}
+	// Fast probe closes the breaker early.
+	feed(50*time.Millisecond, 50*time.Millisecond, now.Add(25*time.Second))
+	if !allow(now.Add(26 * time.Second)) {
+		t.Fatal("fast probe should close the breaker")
 	}
 }
