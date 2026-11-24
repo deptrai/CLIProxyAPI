@@ -7,4 +7,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+require github.com/MoeForge/moego v0.1.0-alpha.5 // indirect
+
 replace github.com/router-for-me/CLIProxyAPI/v7 => ../../../..

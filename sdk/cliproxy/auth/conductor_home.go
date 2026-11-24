@@ -1381,7 +1381,6 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	registryRef := registry.GetGlobalRegistry()
 	now := time.Now()
 	var candidates []creditsCandidateEntry
-	registryRef := registry.GetGlobalRegistry()
 	m.mu.RLock()
 	if affinity, ok := m.selector.(*SessionAffinitySelector); ok && affinity != nil && affinity.rebindOnNever {
 		if boundAuthID, okBound := affinity.boundAuthForRequest([]string{"antigravity"}, selectionModel, opts); okBound {
